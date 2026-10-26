@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.1
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -114,7 +114,9 @@
     }
 
     function distanciaEdicao(a, b) {
-        let ant = Array.from({ length: b.length + 1 }, (_, j) => j);
+        // sem Array.from(..., fn): a Prototype.js do e-cidade substitui Array.from e ignora o mapeamento
+        let ant = [];
+        for (let j = 0; j <= b.length; j++) ant.push(j);
         for (let i = 1; i <= a.length; i++) {
             let atual = [i];
             for (let j = 1; j <= b.length; j++) {
@@ -331,7 +333,21 @@
     }
 
     // Monta as linhas visuais do PDF agrupando os textos pela coordenada Y
+    // O e-cidade usa a Prototype.js, que adiciona métodos enumeráveis em Array.prototype
+    // (each, pluck, clear...). O pdf.js recusa rodar assim, então durante a leitura do PDF
+    // esses métodos ficam não-enumeráveis (continuam funcionando) e depois são restaurados.
     async function extrairLinhasPdf(pdfjs, buffer, aoProgredir) {
+        let chaves = [];
+        for (let k in Array.prototype) chaves.push(k); // eslint-disable-line guard-for-in
+        chaves.forEach(k => Object.defineProperty(Array.prototype, k, { enumerable: false }));
+        try {
+            return await extrairLinhasPdfInterno(pdfjs, buffer, aoProgredir);
+        } finally {
+            chaves.forEach(k => Object.defineProperty(Array.prototype, k, { enumerable: true }));
+        }
+    }
+
+    async function extrairLinhasPdfInterno(pdfjs, buffer, aoProgredir) {
         let doc = await pdfjs.getDocument({ data: new Uint8Array(buffer) }).promise;
         let linhas = [];
         for (let p = 1; p <= doc.numPages; p++) {
