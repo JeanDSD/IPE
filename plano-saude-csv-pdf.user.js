@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.2
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -81,7 +81,12 @@
 
     function parseCentavos(valorString) {
         if (valorString === null || valorString === undefined) return 0;
-        let limpo = valorString.toString().replace(/[R$\s]/g, '').replace(/\./g, '').replace(',', '.');
+        let limpo = valorString.toString().replace(/[R$\s%]/g, '');
+        if (limpo.includes(',')) {
+            limpo = limpo.replace(/\./g, '').replace(',', '.');       // 1.173,07 (padrão BR)
+        } else if (/^\d{1,3}(\.\d{3})+$/.test(limpo)) {
+            limpo = limpo.replace(/\./g, '');                         // 1.173 (só milhar)
+        }                                                              // senão 67.73: ponto decimal (grid do e-cidade)
         let num = parseFloat(limpo);
         return isNaN(num) ? 0 : Math.round(num * 100);
     }
