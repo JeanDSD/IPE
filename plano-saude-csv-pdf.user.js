@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -21,6 +21,7 @@
     const TEMPO_ESPERA_POS_SALVAR = 1000;
     const TEMPO_LIMITE = 15000;            // limite das esperas dinâmicas (aba, popup, carregamento)
     const TEMPO_LIMITE_SALVAR = 20000;     // limite para o dependente aparecer no grid após salvar
+    const TEMPO_LIMITE_COMPETENCIA = 6000; // sem a competência na lista nesse tempo: servidor é pulado
 
     // =========================================================================
     // IDS / SELETORES DA TELA "PLANO DE SAÚDE" (pes1_plano_saude_servidor001.php)
@@ -52,6 +53,7 @@
     const PERCENTUAL_FILHO = '0';           // filho(a) ou enteado(a)
     const PERCENTUAL_CONJUGE = '67,73';     // cônjuge: mesmo percentual do titular
     const IDADE_MAIORIDADE = 18;
+    const IDADE_LIMITE_FILHO = 24;          // de 18 a 24 anos o tipo é decidido pelo valor
     const TIPO_FILHO = 'filho ou enteado';
     const TIPO_CONJUGE = 'cônjuge';
     // Únicas opções aceitas no <select> Tipo (comparadas sem acento e em minúsculas)
@@ -72,6 +74,7 @@
     const K_PULAR_LANCADOS = 'ecps_pular_lancados';
     const K_RESUMO = 'ecps_resumo';
     const K_ALERTA = 'ecps_alerta';
+    const K_SEM_COMPETENCIA = 'ecps_sem_competencia';
 
     // =========================================================================
     // <<NUCLEO>> PROCESSAMENTO DOS ARQUIVOS (funções puras, sem DOM)
@@ -222,8 +225,17 @@
         return tipo === TIPO_CONJUGE ? PERCENTUAL_CONJUGE : PERCENTUAL_FILHO;
     }
 
-    function tipoDependentePorIdade(idade) {
-        return idade < IDADE_MAIORIDADE ? TIPO_FILHO : TIPO_CONJUGE;
+    // Menos de 18 anos: filho. De 18 a 24: decide pelo valor (menor que o do titular = filho,
+    // igual ao do titular = cônjuge). 25 ou mais: cônjuge.
+    // Retorna null quando não dá para decidir (18 a 24 anos com valor maior que o do titular).
+    function tipoDependente(idade, valorDependente, valorTitular) {
+        if (idade < IDADE_MAIORIDADE) return TIPO_FILHO;
+        if (idade <= IDADE_LIMITE_FILHO) {
+            if (valorDependente < valorTitular) return TIPO_FILHO;
+            if (valorDependente === valorTitular) return TIPO_CONJUGE;
+            return null;
+        }
+        return TIPO_CONJUGE;
     }
 
     function somaTitular(t) {
@@ -284,6 +296,14 @@
                 }));
                 return;
             }
+            let tipos = t.dependentes.map(d => tipoDependente(d.idade, d.contribuicao, t.contribuicao));
+            let indefinido = t.dependentes.find((d, k) => !tipos[k]);
+            if (indefinido) {
+                erros.push(Object.assign(base, {
+                    motivo: `Dependente "${indefinido.nome}" (${indefinido.idade} anos) com valor ${formatCentavos(indefinido.contribuicao)} maior que o do titular (${formatCentavos(t.contribuicao)}): não dá para saber se é filho ou cônjuge`
+                }));
+                return;
+            }
             lista.push({
                 matricula: s.matricula,
                 nome: s.nome,
@@ -292,12 +312,13 @@
                 casamentoAproximado: aproximados.has(i),
                 valorCsv: formatCentavos(s.valorCsv),
                 titular: { valor: formatCentavos(t.contribuicao), percentual: PERCENTUAL_TITULAR },
-                dependentes: t.dependentes.map(d => ({
+                dependentes: t.dependentes.map((d, k) => ({
                     nome: d.nome,
                     idade: d.idade,
                     nascimento: d.nascimento,
-                    tipo: tipoDependentePorIdade(d.idade),
-                    percentual: percentualDependentePorTipo(tipoDependentePorIdade(d.idade)),
+                    tipo: tipos[k],
+                    tipoPeloValor: d.idade >= IDADE_MAIORIDADE && d.idade <= IDADE_LIMITE_FILHO,
+                    percentual: percentualDependentePorTipo(tipos[k]),
                     valor: formatCentavos(d.contribuicao)
                 }))
             });
@@ -419,10 +440,16 @@
             localStorage.setItem(K_ETAPA, '');
             localStorage.setItem(K_STATUS, 'parado');
             localStorage.setItem(K_LOG, '[]');
+            localStorage.setItem(K_SEM_COMPETENCIA, '[]');
 
             registrarLog('info', '-', `CSV: ${servidores.length} matrículas | PDF: ${titulares.length} titulares, ${registros.length - titulares.length} dependentes`);
             registrarLog('info', '-', `Validados: ${lista.length} | Com erro no cruzamento: ${erros.length}`);
             erros.forEach(e => registrarLog('erro', e.matricula, `${e.nome}: ${e.motivo}`));
+            let peloValor = [];
+            lista.forEach(r => r.dependentes.forEach(d => { if (d.tipoPeloValor) peloValor.push(d); }));
+            if (peloValor.length) {
+                registrarLog('info', '-', `Dependentes de 18 a 24 anos classificados pelo valor: ${peloValor.filter(d => d.tipo === TIPO_FILHO).length} filho(s), ${peloValor.filter(d => d.tipo === TIPO_CONJUGE).length} cônjuge(s)`);
+            }
             lista.filter(r => r.casamentoAproximado)
                 .forEach(r => registrarLog('aviso', r.matricula, `Casado por nome aproximado + valor: "${r.nome}" ≈ PDF "${r.nomePdf}"`));
             localStorage.setItem(K_RESUMO, `Cruzamento: ${lista.length} validados, ${erros.length} com erro`);
@@ -441,6 +468,9 @@
 
     // Pausa "boa": o robô preencheu e espera o usuário revisar e salvar (modo sem Salvar automático)
     class PausaRevisao extends Error {}
+
+    // Servidor sem a competência na lista do e-cidade: é pulado e anotado (não pausa o robô)
+    class SemCompetencia extends Error {}
 
     function checarParada() {
         if (localStorage.getItem(K_STATUS) !== 'rodando') throw new Error('Interrompido pelo usuário (⏸ Parar)');
@@ -886,10 +916,16 @@
         await esperar(TEMPO_ESPERA_MATRICULA);
 
         let opcaoDe = sel => Array.from(sel.options).find(o => o.text.includes(competencia) || o.value.includes(competencia));
-        await esperarAte(() => {
+        try {
+            await esperarAte(() => {
+                let c = elementosTitular().competencia;
+                return c && (c.tagName !== 'SELECT' || opcaoDe(c));
+            }, `a competência ${competencia} aparecer na lista`, TEMPO_LIMITE_COMPETENCIA);
+        } catch (e) {
             let c = elementosTitular().competencia;
-            return c && (c.tagName !== 'SELECT' || opcaoDe(c));
-        }, `a competência ${competencia} aparecer na lista`);
+            let disponiveis = c && c.tagName === 'SELECT' ? Array.from(c.options).map(o => o.text.trim()).filter(Boolean).join(', ') : '';
+            throw new SemCompetencia(`Sem a competência ${competencia} (disponíveis: ${disponiveis || 'nenhuma'})`);
+        }
         let campo = elementosTitular().competencia;
         if (campo.tagName === 'SELECT') {
             let opcao = opcaoDe(campo);
@@ -1070,6 +1106,14 @@
         registrarLog('ok', reg.matricula, `Concluído: titular + ${reg.dependentes.length} dependente(s) conferidos`);
     }
 
+    function registrarSemCompetencia(reg) {
+        let competencia = localStorage.getItem(K_COMPETENCIA) || '';
+        let lista = JSON.parse(localStorage.getItem(K_SEM_COMPETENCIA) || '[]')
+            .filter(x => !(x.matricula === reg.matricula && x.competencia === competencia));
+        lista.push({ matricula: reg.matricula, nome: reg.nome, competencia });
+        localStorage.setItem(K_SEM_COMPETENCIA, JSON.stringify(lista));
+    }
+
     async function cicloRobo() {
         if (ocupado) return;
         if (localStorage.getItem(K_STATUS) !== 'rodando') return;
@@ -1088,12 +1132,20 @@
         ocupado = true;
         let reg = dados[index];
         try {
-            if (reg.dependentes.some(d => !d.nascimento || d.percentual !== percentualDependentePorTipo(d.tipo))) {
+            let desatualizada = reg.dependentes.some(d => !d.nascimento || d.percentual !== percentualDependentePorTipo(d.tipo) ||
+                d.tipo !== tipoDependente(d.idade, parseCentavos(d.valor), parseCentavos(reg.titular.valor)));
+            if (desatualizada) {
                 throw new Error('Lista gerada por versão antiga do robô. Clique de novo em "⚙ Cruzar e Validar Arquivos".');
             }
             await processarRegistro(reg);
             localStorage.setItem(K_INDEX, String(index + 1));
         } catch (e) {
+            if (e instanceof SemCompetencia) {
+                registrarSemCompetencia(reg);
+                registrarLog('aviso', reg.matricula, `${reg.nome}: ${e.message} — pulado e anotado na lista "Sem competência"`);
+                localStorage.setItem(K_INDEX, String(index + 1));
+                return;
+            }
             localStorage.setItem(K_STATUS, 'parado');
             if (e instanceof PausaRevisao) {
                 registrarLog('aviso', reg.matricula, e.message);
@@ -1205,6 +1257,7 @@
                     <p style="margin: 0 0 5px 0;">Status: <strong id="ecps-status-texto" style="color:#dc3545;">Parado</strong></p>
                     <p style="margin: 0 0 5px 0; font-size: 12px;" id="ecps-resumo"></p>
                     <p style="margin: 0 0 5px 0;">Progresso: <strong id="ecps-linha">0 / 0</strong> &nbsp;|&nbsp; Erros: <strong id="ecps-qtd-erros" style="color:#dc3545;">0</strong></p>
+                    <p style="margin: 0 0 5px 0; font-size: 12px;">Sem competência (pulados): <strong id="ecps-qtd-sem-comp" style="color:#c77c00;">0</strong></p>
                     <p style="margin: 0; font-size: 12px; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" id="ecps-dados-atuais">Nenhum dado</p>
                     <p style="margin: 3px 0 0 0; font-size: 11px; color: #555; white-space: normal;" id="ecps-detalhe"></p>
                 </div>
@@ -1225,6 +1278,7 @@
                     <button id="ecps-btn-csv" style="${estiloBtn} background: #343a40;">⬇ CSV gerado</button>
                     <button id="ecps-btn-erros" style="${estiloBtn} background: #343a40;">⬇ Erros</button>
                     <button id="ecps-btn-diag" style="${estiloBtn} background: #343a40;">🔎 Diagnóstico</button>
+                    <button id="ecps-btn-sem-comp" style="${estiloBtn} background: #c77c00; flex-basis: 100%;">⬇ Sem competência</button>
                 </div>
             </div>
         `;
@@ -1273,6 +1327,11 @@
             baixarArquivo('plano_saude_erros.csv', linhas.join('\r\n'));
         });
         document.getElementById('ecps-btn-diag').addEventListener('click', diagnosticoCampos);
+        document.getElementById('ecps-btn-sem-comp').addEventListener('click', () => {
+            let lista = JSON.parse(localStorage.getItem(K_SEM_COMPETENCIA) || '[]');
+            let linhas = ['MATRICULA;NOME;COMPETENCIA'].concat(lista.map(x => [x.matricula, x.nome, x.competencia].join(';')));
+            baixarArquivo('plano_saude_sem_competencia.csv', linhas.join('\r\n'));
+        });
 
         renderizarLog();
         atualizarPainel();
@@ -1300,6 +1359,7 @@
         let detalheElement = document.getElementById('ecps-detalhe');
         if (!statusElement) return;
         document.getElementById('ecps-resumo').textContent = localStorage.getItem(K_RESUMO) || 'Arquivos ainda não processados';
+        document.getElementById('ecps-qtd-sem-comp').textContent = JSON.parse(localStorage.getItem(K_SEM_COMPETENCIA) || '[]').length;
 
         let status = localStorage.getItem(K_STATUS) || 'parado';
         let dados = JSON.parse(localStorage.getItem(K_DADOS) || '[]');
