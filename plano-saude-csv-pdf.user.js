@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.0
+// @version      6.1
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -49,7 +49,8 @@
     // REGRAS DE NEGÓCIO
     // =========================================================================
     const PERCENTUAL_TITULAR = '67,73';
-    const PERCENTUAL_DEPENDENTE = '0';
+    const PERCENTUAL_FILHO = '0';           // filho(a) ou enteado(a)
+    const PERCENTUAL_CONJUGE = '67,73';     // cônjuge: mesmo percentual do titular
     const IDADE_MAIORIDADE = 18;
     const TIPO_FILHO = 'filho ou enteado';
     const TIPO_CONJUGE = 'cônjuge';
@@ -212,6 +213,10 @@
         return servidores;
     }
 
+    function percentualDependentePorTipo(tipo) {
+        return tipo === TIPO_CONJUGE ? PERCENTUAL_CONJUGE : PERCENTUAL_FILHO;
+    }
+
     function tipoDependentePorIdade(idade) {
         return idade < IDADE_MAIORIDADE ? TIPO_FILHO : TIPO_CONJUGE;
     }
@@ -287,7 +292,7 @@
                     idade: d.idade,
                     nascimento: d.nascimento,
                     tipo: tipoDependentePorIdade(d.idade),
-                    percentual: PERCENTUAL_DEPENDENTE,
+                    percentual: percentualDependentePorTipo(tipoDependentePorIdade(d.idade)),
                     valor: formatCentavos(d.contribuicao)
                 }))
             });
@@ -1078,7 +1083,7 @@
         ocupado = true;
         let reg = dados[index];
         try {
-            if (reg.dependentes.some(d => !d.nascimento)) {
+            if (reg.dependentes.some(d => !d.nascimento || d.percentual !== percentualDependentePorTipo(d.tipo))) {
                 throw new Error('Lista gerada por versão antiga do robô. Clique de novo em "⚙ Cruzar e Validar Arquivos".');
             }
             await processarRegistro(reg);
@@ -1309,7 +1314,7 @@
                 let r = dados[index];
                 if (!ocupado) mostrarAtual(`Matrícula em foco: ${r.matricula} - ${r.nome}`);
                 detalheElement.textContent = `Titular R$ ${r.titular.valor} (${r.titular.percentual}%)` +
-                    r.dependentes.map(d => ` + ${d.tipo} R$ ${d.valor}`).join('') + ` = R$ ${r.valorCsv}`;
+                    r.dependentes.map(d => ` + ${d.tipo} R$ ${d.valor} (${d.percentual}%)`).join('') + ` = R$ ${r.valorCsv}`;
             } else {
                 detalheElement.textContent = 'Fim da lista.';
             }
