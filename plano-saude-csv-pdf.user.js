@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -565,22 +565,44 @@
         }
     }
 
+    // Um nome é o outro sem os nomes do meio: "JOVANA ORTIZ" x "JOVANA MACHADO ORTIZ"
+    // (mesmo primeiro e último nome, e os termos do nome curto aparecem na mesma ordem no longo)
+    function nomeContido(curto, longo) {
+        let a = normalizarNome(curto).split(' ').filter(t => !PARTICULAS.includes(t));
+        let b = normalizarNome(longo).split(' ').filter(t => !PARTICULAS.includes(t));
+        if (a.length < 2 || a.length >= b.length) return false;
+        if (a[0] !== b[0] || a[a.length - 1] !== b[b.length - 1]) return false;
+        let j = 0;
+        for (let t of a) {
+            while (j < b.length && !termosParecidos(t, b[j])) j++;
+            if (j === b.length) return false;
+            j++;
+        }
+        return true;
+    }
+
     function nomesBatem(a, b) {
         let na = normalizarNome(a);
         let nb = normalizarNome(b);
         if (!na || !nb) return false;
         if (na === nb) return true;
         if (Math.min(na.length, nb.length) >= 20 && (na.startsWith(nb) || nb.startsWith(na))) return true; // nome cortado no CSV
-        return nomesCompativeis(a, b) || nomesCompativeis(b, a) || nomesSemelhantes(a, b);
+        return nomesCompativeis(a, b) || nomesCompativeis(b, a) || nomeContido(a, b) || nomeContido(b, a) || nomesSemelhantes(a, b);
     }
 
-    // Prefere casamento estrito (igual/abreviado); só usa o aproximado se o estrito não achar nada
+    // Casa por níveis, do mais exato ao mais solto, e para no primeiro nível que achar alguém:
+    // 1) igual ou abreviado  2) sem os nomes do meio  3) aproximado (2 sobrenomes em comum etc.)
     function filtrarPorNome(lista, nomeDe, nome) {
-        let estritos = lista.filter(l => {
-            let n = nomeDe(l);
-            return normalizarNome(n) === normalizarNome(nome) || nomesCompativeis(n, nome) || nomesCompativeis(nome, n);
-        });
-        return estritos.length ? estritos : lista.filter(l => nomesBatem(nomeDe(l), nome));
+        let niveis = [
+            n => normalizarNome(n) === normalizarNome(nome) || nomesCompativeis(n, nome) || nomesCompativeis(nome, n),
+            n => nomeContido(n, nome) || nomeContido(nome, n),
+            n => nomesBatem(n, nome)
+        ];
+        for (let teste of niveis) {
+            let achados = lista.filter(l => teste(nomeDe(l)));
+            if (achados.length) return achados;
+        }
+        return [];
     }
 
     // =========================================================================
@@ -672,22 +694,37 @@
 
     // Lê uma tabela: acha a linha de cabeçalho (com as colunas pedidas) e devolve as linhas seguintes
     // como objetos { 'nome': ..., 'tipo': ..., _tr, _cel }
+    const COLUNAS_CONHECIDAS = ['matricula do servidor', 'nome do dependente', 'data de nascimento', 'percentual e.',
+        'codigo', 'nome', 'tipo', 'valor'];
+
+    // Cabeçalho pode vir com sobra (ícone de ordenação, espaços): "nome do dependente ▲" -> "nome do dependente"
+    function colunaCanonica(texto) {
+        let t = textoNorm(texto);
+        return COLUNAS_CONHECIDAS.find(c => t === c || t.startsWith(c + ' ')) || t;
+    }
+
     function lerTabela(escopo, colunasObrigatorias) {
         if (!escopo) return null;
         let trs = Array.from(escopo.querySelectorAll('tr'));
         let iCab = trs.findIndex(tr => {
-            let textos = Array.from(tr.cells).map(c => textoNorm(c.textContent));
+            let textos = Array.from(tr.cells).map(c => colunaCanonica(c.textContent));
             return colunasObrigatorias.every(col => textos.includes(col));
         });
         if (iCab < 0) return null;
-        let cab = Array.from(trs[iCab].cells).map(c => textoNorm(c.textContent));
+        let trCab = trs[iCab];
+        let cab = Array.from(trCab.cells).map(c => colunaCanonica(c.textContent));
+        let tabelaCab = trCab.closest('table');
         let linhas = [];
         for (let tr of trs.slice(iCab + 1)) {
-            if (tr.cells.length < cab.length) continue;
+            // Na mesma tabela do cabeçalho aceita linhas com colunas a menos (colunas ocultas no cabeçalho);
+            // em tabelas seguintes (grid com cabeçalho separado) exige a mesma quantidade
+            let minimo = tr.closest('table') === tabelaCab ? 2 : cab.length;
+            if (tr.cells.length < minimo || tr.querySelector('table')) continue;
             let obj = { _tr: tr, _cel: {} };
             let algumTexto = false;
             cab.forEach((col, i) => {
                 let celula = tr.cells[i];
+                if (!celula) return;
                 obj[col] = (celula.textContent || '').replace(/\s+/g, ' ').trim();
                 obj._cel[col] = celula;
                 if (obj[col]) algumTexto = true;
@@ -838,15 +875,38 @@
     // =========================================================================
     // POPUP "PESQUISAR DEPENDENTES"
     // =========================================================================
-    function acharPopupDependentes() {
+    // Procura o popup em todos os documentos acessíveis. Dá preferência ao visível; um popup
+    // "invisível" só é aceito se as linhas forem da matrícula atual (evita usar um popup antigo).
+    function acharPopupDependentes(matricula) {
+        let reserva = null;
         for (let d of documentosAcessiveis()) {
-            if (d === document || !d.body || !frameVisivel(d)) continue;
+            if (!d.body) continue;
             let linhas = lerTabela(d.body, ['nome do dependente']);
             if (linhas === null) continue;
-            let semRegistros = /retornados 0 registro|nenhum registro/.test(textoNorm(d.body.textContent));
-            if (linhas.length || semRegistros) return { doc: d, linhas };
+            let texto = textoNorm(d.body.textContent);
+            let qtd = texto.match(/retornados (\d+) registro/);
+            if (!linhas.length && !(qtd && qtd[1] === '0') && !/nenhum registro/.test(texto)) continue;
+            let popup = { doc: d, linhas };
+            if (frameVisivel(d)) return popup;
+            if (!reserva && matricula && linhas.some(l => l['matricula do servidor'] === matricula)) reserva = popup;
         }
-        return null;
+        return reserva;
+    }
+
+    // Resumo dos frames para o log quando o popup não é reconhecido
+    function resumoFrames() {
+        return documentosAcessiveis().map((d, i) => {
+            let url = '';
+            try { url = (d.location.pathname || '').split('/').pop(); } catch (e) { /* sem acesso */ }
+            let texto = d.body ? textoNorm(d.body.textContent) : '';
+            return `${i}:${url || '?'}[visível:${frameVisivel(d) ? 'S' : 'N'} "nome do dependente":${texto.includes('nome do dependente') ? 'S' : 'N'} linhas:${d.querySelectorAll('tr').length}]`;
+        }).join(' ');
+    }
+
+    function fecharPopupsVisiveis() {
+        documentosAcessiveis().forEach(d => {
+            if (d.body && frameVisivel(d) && textoNorm(d.body.textContent).includes('nome do dependente')) fecharPopup({ doc: d });
+        });
     }
 
     function fecharPopup(popup) {
@@ -860,6 +920,16 @@
         for (let pagina = 1; pagina <= 10; pagina++) {
             let doServidor = popup.linhas.filter(l => !l['matricula do servidor'] || l['matricula do servidor'] === reg.matricula);
             let porNome = filtrarPorNome(doServidor, l => l['nome do dependente'], dep.nome);
+            // Nome muito diferente no sistema: aceita pela data de nascimento se for única e o primeiro nome bater
+            if (!porNome.length && dep.nascimento) {
+                let primeiro = normalizarNome(dep.nome).split(' ')[0];
+                let porData = doServidor.filter(l => l['data de nascimento'] === dep.nascimento &&
+                    normalizarNome(l['nome do dependente']).split(' ')[0] === primeiro);
+                if (porData.length === 1) {
+                    registrarLog('aviso', reg.matricula, `${rotulo}: casado pela data de nascimento com "${porData[0]['nome do dependente']}"`);
+                    return porData[0];
+                }
+            }
             let candidatos = dep.nascimento
                 ? porNome.filter(l => !l['data de nascimento'] || l['data de nascimento'] === dep.nascimento)
                 : porNome;
@@ -877,7 +947,7 @@
             let assinatura = popup.linhas.map(l => l._tr.textContent).join('|');
             proximo.click();
             popup = await esperarAte(() => {
-                let p = acharPopupDependentes();
+                let p = acharPopupDependentes(reg.matricula);
                 return p && p.linhas.map(l => l._tr.textContent).join('|') !== assinatura ? p : null;
             }, 'a próxima página do popup');
         }
@@ -980,18 +1050,40 @@
 
         // 2. Link azul "Dependente:" -> popup "Pesquisar Dependentes"
         elementosDependente().link.click();
-        let popup = await esperarAte(acharPopupDependentes, 'o popup "Pesquisar Dependentes" carregar');
+        let popup;
+        try {
+            popup = await esperarAte(() => acharPopupDependentes(reg.matricula), 'o popup "Pesquisar Dependentes" carregar');
+        } catch (err) {
+            let frames = resumoFrames();
+            console.log('[Robô Plano de Saúde] popup não reconhecido. Frames:', frames);
+            fecharPopupsVisiveis();
+            throw new Error(`${err.message}. Frames: ${frames} — clique em 🔎 Diagnóstico com o popup aberto e envie o arquivo`);
+        }
         protegerAlertasDosFrames();
         let linha = await escolherNoPopup(popup, dep, reg, rotulo);
         let nomeSistema = linha['nome do dependente'];
         let codigoSistema = linha['codigo'] || '';
+
+        // Antes de adicionar: com o nome do sistema, confere se ele já está no grid (evita duplicar)
+        let jaNoGrid = situacaoNoGrid(lerGridDependentes(), nomeSistema, dep);
+        if (jaNoGrid.status !== 'ausente') {
+            fecharPopup(popup);
+            if (jaNoGrid.status === 'igual') {
+                registrarLog('info', reg.matricula, `Dependente "${nomeSistema}" (PDF: ${dep.nome}) já lançado corretamente`);
+                return nomeSistema;
+            }
+            if (jaNoGrid.status === 'diferente') {
+                throw new Error(`Dependente "${nomeSistema}" (PDF: ${dep.nome}) já está no grid com dados diferentes — grid: ${descreverLinhaGrid(jaNoGrid.linha)} | PDF: ${dep.tipo}, R$ ${dep.valor}, ${dep.percentual}%. Corrija manualmente (botão "A")`);
+            }
+            throw new Error(`Dependente "${nomeSistema}" casa com mais de uma linha do grid: ${jaNoGrid.linhas.map(descreverLinhaGrid).join(' / ')}`);
+        }
         clicarLinhaPopup(linha);
         await esperarAte(() => {
             let x = elementosDependente();
             return x.nome && x.nome.value.trim() && nomesBatem(x.nome.value, nomeSistema) &&
                 (!codigoSistema || x.codigo.value.trim() === codigoSistema);
         }, `o ${rotulo} voltar do popup para o formulário`);
-        await esperarAte(() => !acharPopupDependentes(), 'o popup fechar', 5000).catch(() => null);
+        await esperarAte(() => !acharPopupDependentes(), 'o popup fechar', 5000).catch(() => null); // só aceita popup visível
         checarParada();
 
         // 3. Tipo (somente cônjuge / filho(a) ou enteado(a))
@@ -1032,6 +1124,7 @@
         if (resultado.erro) throw new Error(`Sistema recusou o ${rotulo}: ${resultado.erro}`);
         registrarLog('ok', reg.matricula, `Dependente "${nomeSistema}" salvo e conferido no grid (${dep.tipo}, R$ ${dep.valor}, ${dep.percentual}%)` +
             (alerta ? ` — Sistema: ${alerta}` : ''));
+        return nomeSistema;
     }
 
     // =========================================================================
@@ -1079,6 +1172,7 @@
         mostrarAtual(`Mat. ${reg.matricula}: abrindo aba Dependentes...`);
         await irParaAba('Dependentes', 'Dependente');
         let grid = await lerGridDependentesEstavel();
+        let conferidos = []; // nomes (como estão no sistema) já casados com dependentes do PDF
 
         for (let i = 0; i < reg.dependentes.length; i++) {
             checarParada();
@@ -1087,6 +1181,7 @@
             let situacao = situacaoNoGrid(grid, d.nome, d);
             if (situacao.status === 'igual') {
                 registrarLog('info', reg.matricula, `Dependente "${situacao.linha.nome}" já lançado corretamente`);
+                conferidos.push(situacao.linha.nome);
                 continue;
             }
             if (situacao.status === 'diferente') {
@@ -1095,11 +1190,11 @@
             if (situacao.status === 'ambiguo') {
                 throw new Error(`Dependente "${d.nome}" casa com mais de uma linha do grid: ${situacao.linhas.map(descreverLinhaGrid).join(' / ')}`);
             }
-            await lancarDependente(d, i + 1, reg, autoSalvar);
+            conferidos.push(await lancarDependente(d, i + 1, reg, autoSalvar));
             grid = await lerGridDependentesEstavel();
         }
 
-        let extras = grid.filter(l => !reg.dependentes.some(d => filtrarPorNome([l], x => x.nome, d.nome).length));
+        let extras = grid.filter(l => !conferidos.includes(l.nome));
         if (extras.length) registrarLog('aviso', reg.matricula, `No grid, mas não no PDF (não alterados): ${extras.map(l => l.nome).join(', ')}`);
 
         await irParaAba('Planos de Saúde', 'Plano de Saúde do Servidor');
