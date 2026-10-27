@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.5
+// @version      6.6
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -22,6 +22,8 @@
     const TEMPO_LIMITE = 15000;            // limite das esperas dinâmicas (aba, popup, carregamento)
     const TEMPO_LIMITE_SALVAR = 20000;     // limite para o dependente aparecer no grid após salvar
     const TEMPO_LIMITE_COMPETENCIA = 6000; // sem a competência na lista nesse tempo: servidor é pulado
+    const TEMPO_LIMITE_POPUP = 8000;       // espera por tentativa de abrir o popup de dependentes
+    const TENTATIVAS_POPUP = 3;            // cliques no link "Dependente:" antes de virar pendência
 
     // =========================================================================
     // IDS / SELETORES DA TELA "PLANO DE SAÚDE" (pes1_plano_saude_servidor001.php)
@@ -870,8 +872,9 @@
     // =========================================================================
     // POPUP "PESQUISAR DEPENDENTES"
     // =========================================================================
-    // Procura o popup em todos os documentos acessíveis. Dá preferência ao visível; um popup
-    // "invisível" só é aceito se as linhas forem da matrícula atual (evita usar um popup antigo).
+    // Procura o popup em todos os documentos acessíveis. O e-cidade reaproveita o iframe do popup e,
+    // ao reabrir, mostra por um instante a lista do servidor anterior: listas de outra matrícula são
+    // ignoradas. Dá preferência ao visível; um "invisível" só vale com linhas da matrícula atual.
     function acharPopupDependentes(matricula) {
         let reserva = null;
         for (let d of documentosAcessiveis()) {
@@ -882,6 +885,8 @@
             if (!linhas || !linhas.length) linhas = lerLinhasPopupSemCabecalho(d);
             let qtd = texto.match(/retornados (\d+) registro/);
             if (!linhas.length && !(qtd && qtd[1] === '0') && !/nenhum registro/.test(texto)) continue;
+            let comMatricula = linhas.filter(l => l['matricula do servidor']);
+            if (matricula && comMatricula.length && !comMatricula.some(l => l['matricula do servidor'] === matricula)) continue;
             let popup = { doc: d, linhas };
             if (frameVisivel(d)) return popup;
             if (!reserva && matricula && linhas.some(l => l['matricula do servidor'] === matricula)) reserva = popup;
@@ -960,8 +965,14 @@
                 fecharPopup(popup);
                 throw new Pendencia(`${rotulo}: nome achado no popup, mas a data de nascimento não confere (PDF ${dep.nascimento} x sistema ${porNome.map(l => l['data de nascimento']).join(', ')})`);
             }
+            // Só pagina se ainda há registros: "Foram retornados N registros. Mostrando de X até Y"
+            // (o botão Próximo do e-cidade fica habilitado mesmo quando tudo já está na tela)
+            let texto = popup.doc.body ? textoNorm(popup.doc.body.textContent) : '';
+            let total = texto.match(/retornados (\d+) registro/);
+            let ate = texto.match(/mostrando de \d+ ate (\d+)/);
+            let temMais = total && ate ? parseInt(ate[1], 10) < parseInt(total[1], 10) : true;
             let proximo = botaoNoDoc(popup.doc, 'Próximo');
-            if (!proximo || proximo.disabled) break;
+            if (!temMais || !proximo || proximo.disabled) break;
             let assinatura = popup.linhas.map(l => l._tr.textContent).join('|');
             proximo.click();
             try {
@@ -977,6 +988,34 @@
         let listados = popup.linhas.map(l => l['nome do dependente']).join(', ');
         fecharPopup(popup);
         throw new Pendencia(`${rotulo} não encontrado no popup "Pesquisar Dependentes" (listados: ${listados || 'nenhum'})`);
+    }
+
+    // Clica no link "Dependente:" e espera o popup com a lista DESTE servidor; se não abrir,
+    // fecha o que estiver aberto e tenta de novo (às vezes o primeiro clique não abre o popup)
+    async function abrirPopupDependentes(reg, rotulo) {
+        for (let tentativa = 1; tentativa <= TENTATIVAS_POPUP; tentativa++) {
+            checarParada();
+            elementosDependente().link.click();
+            try {
+                let popup = await esperarAte(() => acharPopupDependentes(reg.matricula),
+                    'o popup "Pesquisar Dependentes" carregar', TEMPO_LIMITE_POPUP);
+                if (!popup.linhas.length) {
+                    // "0 registros" pode ser resto da pesquisa anterior: confirma depois de um instante
+                    await esperar(1500);
+                    popup = acharPopupDependentes(reg.matricula) || popup;
+                }
+                return popup;
+            } catch (err) {
+                fecharPopupsVisiveis();
+                if (tentativa < TENTATIVAS_POPUP) {
+                    registrarLog('aviso', reg.matricula, `${rotulo}: popup não abriu com a lista do servidor (tentativa ${tentativa}); tentando de novo`);
+                    await esperar(1000);
+                }
+            }
+        }
+        let frames = resumoFrames();
+        console.log('[Robô Plano de Saúde] popup não reconhecido. Frames:', frames);
+        throw new Pendencia(`${rotulo}: popup "Pesquisar Dependentes" não abriu com a lista do servidor após ${TENTATIVAS_POPUP} tentativas. Frames: ${frames}`);
     }
 
     function clicarLinhaPopup(linha) {
@@ -1072,16 +1111,7 @@
         }
 
         // 2. Link azul "Dependente:" -> popup "Pesquisar Dependentes"
-        elementosDependente().link.click();
-        let popup;
-        try {
-            popup = await esperarAte(() => acharPopupDependentes(reg.matricula), 'o popup "Pesquisar Dependentes" carregar');
-        } catch (err) {
-            let frames = resumoFrames();
-            console.log('[Robô Plano de Saúde] popup não reconhecido. Frames:', frames);
-            fecharPopupsVisiveis();
-            throw new Pendencia(`${rotulo}: popup "Pesquisar Dependentes" não foi lido. Frames: ${frames}`);
-        }
+        let popup = await abrirPopupDependentes(reg, rotulo);
         protegerAlertasDosFrames();
         let linha = await escolherNoPopup(popup, dep, reg, rotulo);
         let nomeSistema = linha['nome do dependente'];
