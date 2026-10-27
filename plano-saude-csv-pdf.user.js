@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.7
+// @version      6.8
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -459,6 +459,7 @@
     // =========================================================================
     const esperar = ms => new Promise(r => setTimeout(r, ms));
     const REGEX_ALERTA_ERRO = /erro|inv[aá]lid|obrigat|n[aã]o foi|n[aã]o pode|falha|j[aá] existe|j[aá] cadastrad/i;
+    const REGEX_ALERTA_SUCESSO = /sucesso|salv[oa]s? com|gravad|inclu[ií]d|alterad/i;
 
     // Pausa "boa": o robô preencheu e espera o usuário revisar e salvar (modo sem Salvar automático)
     class PausaRevisao extends Error {}
@@ -650,7 +651,40 @@
         documentosAcessiveis().forEach(d => instalarCapturaAlerta(d.defaultView));
     }
 
+    // Janela de erro do e-cidade feita em HTML (não é alert): "Erro ao carregar dados: Uncaught
+    // exception ... on line 68" com um botão OK. Acha o botão OK cujo quadro tem texto de exceção.
+    function acharDialogoErro() {
+        for (let d of documentosAcessiveis()) {
+            let botoes = Array.from(d.querySelectorAll('button, input[type=button], input[type=submit], a'))
+                .filter(b => visivel(b) && !b.closest('#painel-ecps') && textoNorm(b.value || b.textContent) === 'ok');
+            for (let b of botoes) {
+                let el = b.parentElement;
+                for (let n = 0; el && el !== d.body && n < 6; n++, el = el.parentElement) {
+                    let texto = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (texto.length > 2000) break;
+                    if (ehErroDoSistema(texto)) return { botao: b, mensagem: texto.replace(/\s*ok$/i, '') };
+                }
+            }
+        }
+        return null;
+    }
+
+    // Com o robô rodando, dá OK na janela de erro e repassa a mensagem como se fosse um alert
+    let ultimaBuscaDialogo = 0;
+    function dispensarDialogoErro() {
+        if (localStorage.getItem(K_STATUS) !== 'rodando') return;
+        let agora = Date.now();
+        if (agora - ultimaBuscaDialogo < 250) return;
+        ultimaBuscaDialogo = agora;
+        let dialogo = acharDialogoErro();
+        if (!dialogo) return;
+        console.log('[Robô Plano de Saúde] janela de erro do e-cidade (OK dado):', dialogo.mensagem);
+        try { dialogo.botao.click(); } catch (e) { /* janela já fechada */ }
+        localStorage.setItem(K_ALERTA, dialogo.mensagem);
+    }
+
     function espiarAlerta() {
+        dispensarDialogoErro();
         return localStorage.getItem(K_ALERTA);
     }
 
@@ -1054,12 +1088,20 @@
     async function carregarServidor(reg, competencia) {
         let t = elementosTitular();
         exigirCampos(t, ['codigo', 'competencia'], 'Titular');
-        lerAlerta();
+        let pendente = lerAlerta();
+        if (ehErroDoSistema(pendente)) throw new ErroSistema(pendente);
         preencherCampo(t.codigo, reg.matricula);
         dispararEnter(t.codigo);
         try {
             await esperarAte(() => {
-                if (espiarAlerta()) return true;
+                let a = espiarAlerta();
+                if (a && REGEX_ALERTA_SUCESSO.test(a) && !REGEX_ALERTA_ERRO.test(a)) {
+                    // aviso atrasado de outra ação (ex: "salvo com sucesso!"): anota e continua esperando
+                    lerAlerta();
+                    registrarLog('info', reg.matricula, 'Sistema: ' + a);
+                } else if (a) {
+                    return true;
+                }
                 let n = elementosTitular().nome;
                 return !n || (n.value.trim() && nomesBatem(n.value, reg.nome));
             }, `carregar a matrícula ${reg.matricula}`);
@@ -1622,6 +1664,7 @@
 
     // Loop de controle
     setInterval(() => {
+        dispensarDialogoErro();
         gerenciarPainel();
         cicloRobo();
     }, TEMPO_LOOP);
