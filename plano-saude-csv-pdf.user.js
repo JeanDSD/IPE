@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.6
+// @version      6.7
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -23,6 +23,7 @@
     const TEMPO_LIMITE_SALVAR = 20000;     // limite para o dependente aparecer no grid após salvar
     const TEMPO_LIMITE_COMPETENCIA = 6000; // sem a competência na lista nesse tempo: servidor é pulado
     const TEMPO_LIMITE_POPUP = 8000;       // espera por tentativa de abrir o popup de dependentes
+    const TENTATIVAS_ERRO_SISTEMA = 3;     // erro interno do e-cidade: tentativas na mesma matrícula
     const TENTATIVAS_POPUP = 3;            // cliques no link "Dependente:" antes de virar pendência
 
     // =========================================================================
@@ -78,6 +79,7 @@
     const K_ALERTA = 'ecps_alerta';
     const K_SEM_COMPETENCIA = 'ecps_sem_competencia';
     const K_PENDENCIAS = 'ecps_pendencias';
+    const K_TENTATIVAS_ERRO = 'ecps_tentativas_erro';
 
     // =========================================================================
     // <<NUCLEO>> PROCESSAMENTO DOS ARQUIVOS (funções puras, sem DOM)
@@ -468,6 +470,20 @@
     // fecha o popup e segue para o próximo servidor (não pausa o robô)
     class Pendencia extends Error {}
 
+    // Erro interno do e-cidade (exceção PHP) num alert: o alert já foi respondido (OK);
+    // o robô repete a matrícula e, se persistir, anota em "Pendências" e segue
+    class ErroSistema extends Error {}
+
+    const REGEX_ERRO_SISTEMA = /uncaught exception|call to a member function|fatal error|stack trace|exception '|on line \d+|\.php\b|erro interno/i;
+
+    function ehErroDoSistema(msg) {
+        return !!msg && REGEX_ERRO_SISTEMA.test(msg);
+    }
+
+    function relancarErroSistema(err) {
+        if (err instanceof ErroSistema) throw err;
+    }
+
     function checarParada() {
         if (localStorage.getItem(K_STATUS) !== 'rodando') throw new Error('Interrompido pelo usuário (⏸ Parar)');
     }
@@ -488,6 +504,12 @@
             };
             const checar = () => {
                 if (terminado) return;
+                let alerta = espiarAlerta();
+                if (ehErroDoSistema(alerta)) {
+                    encerrar();
+                    reject(new ErroSistema(alerta));
+                    return;
+                }
                 let r = null;
                 try { r = condicao(); } catch (e) { r = null; }
                 if (r) { encerrar(); resolve(r); }
@@ -981,6 +1003,7 @@
                     return p && p.linhas.map(l => l._tr.textContent).join('|') !== assinatura ? p : null;
                 }, 'a próxima página do popup');
             } catch (err) {
+                relancarErroSistema(err);
                 fecharPopupsVisiveis();
                 throw new Pendencia(`${rotulo}: ${err.message}`);
             }
@@ -1006,6 +1029,7 @@
                 }
                 return popup;
             } catch (err) {
+                relancarErroSistema(err);
                 fecharPopupsVisiveis();
                 if (tentativa < TENTATIVAS_POPUP) {
                     registrarLog('aviso', reg.matricula, `${rotulo}: popup não abriu com a lista do servidor (tentativa ${tentativa}); tentando de novo`);
@@ -1040,10 +1064,12 @@
                 return !n || (n.value.trim() && nomesBatem(n.value, reg.nome));
             }, `carregar a matrícula ${reg.matricula}`);
         } catch (e) {
+            relancarErroSistema(e);
             let n = elementosTitular().nome;
             throw new Error(`Nome do servidor na tela ("${n ? n.value : ''}") não confere com o CSV ("${reg.nome}")`);
         }
         let alerta = lerAlerta();
+        if (ehErroDoSistema(alerta)) throw new ErroSistema(alerta);
         if (alerta) throw new Error('Sistema recusou a matrícula: ' + alerta);
         await esperar(TEMPO_ESPERA_MATRICULA);
 
@@ -1054,6 +1080,7 @@
                 return c && (c.tagName !== 'SELECT' || opcaoDe(c));
             }, `a competência ${competencia} aparecer na lista`, TEMPO_LIMITE_COMPETENCIA);
         } catch (e) {
+            relancarErroSistema(e);
             let c = elementosTitular().competencia;
             let disponiveis = c && c.tagName === 'SELECT' ? Array.from(c.options).map(o => o.text.trim()).filter(Boolean).join(', ') : '';
             throw new SemCompetencia(`Sem a competência ${competencia} (disponíveis: ${disponiveis || 'nenhuma'})`);
@@ -1081,6 +1108,7 @@
         t.salvar.click();
         await esperarAte(() => espiarAlerta(), 'resposta ao salvar', TEMPO_ESPERA_POS_SALVAR * 3).catch(() => null);
         let alerta = lerAlerta();
+        if (ehErroDoSistema(alerta)) throw new ErroSistema(alerta);
         if (alerta && REGEX_ALERTA_ERRO.test(alerta)) throw new Error('Sistema recusou o titular: ' + alerta);
 
         // Conferência pós-salvar: recarrega o servidor e confere o que ficou gravado
@@ -1170,10 +1198,12 @@
                 return situacaoNoGrid(lerGridDependentes(), nomeSistema, dep).status === 'igual' ? { ok: true } : null;
             }, `o ${rotulo} aparecer no grid "Dependentes do Servidor"`, TEMPO_LIMITE_SALVAR);
         } catch (err) {
+            relancarErroSistema(err);
             let s = situacaoNoGrid(lerGridDependentes(), nomeSistema, dep);
             throw new Error(err.message + (s.linha ? ` (no grid está: ${descreverLinhaGrid(s.linha)})` : ' (não apareceu no grid)'));
         }
         let alerta = lerAlerta();
+        if (ehErroDoSistema(alerta)) throw new ErroSistema(alerta);
         if (resultado.erro) throw new Error(`Sistema recusou o ${rotulo}: ${resultado.erro}`);
         registrarLog('ok', reg.matricula, `Dependente "${nomeSistema}" salvo e conferido no grid (${dep.tipo}, R$ ${dep.valor}, ${dep.percentual}%)` +
             (alerta ? ` — Sistema: ${alerta}` : ''));
@@ -1302,8 +1332,28 @@
                 throw new Error('Lista gerada por versão antiga do robô. Clique de novo em "⚙ Cruzar e Validar Arquivos".');
             }
             await processarRegistro(reg);
+            localStorage.removeItem(K_TENTATIVAS_ERRO);
             localStorage.setItem(K_INDEX, String(index + 1));
         } catch (e) {
+            if (e instanceof ErroSistema) {
+                lerAlerta();
+                fecharPopupsVisiveis();
+                let resumo = e.message.replace(/\s+/g, ' ').slice(0, 160);
+                let anterior = JSON.parse(localStorage.getItem(K_TENTATIVAS_ERRO) || '{}');
+                let n = anterior.index === index ? anterior.n + 1 : 1;
+                if (n < TENTATIVAS_ERRO_SISTEMA) {
+                    localStorage.setItem(K_TENTATIVAS_ERRO, JSON.stringify({ index, n }));
+                    registrarLog('aviso', reg.matricula, `Erro interno do e-cidade (${resumo}) — OK dado; tentando de novo (${n}/${TENTATIVAS_ERRO_SISTEMA})`);
+                    await esperar(3000);
+                    return;
+                }
+                localStorage.removeItem(K_TENTATIVAS_ERRO);
+                registrarPendencia(reg, `Erro interno do e-cidade após ${TENTATIVAS_ERRO_SISTEMA} tentativas: ${resumo}`);
+                registrarLog('erro', reg.matricula, `Erro interno do e-cidade em ${TENTATIVAS_ERRO_SISTEMA} tentativas — anotado em "Pendências"; seguindo para o próximo`);
+                localStorage.setItem(K_INDEX, String(index + 1));
+                return;
+            }
+            localStorage.removeItem(K_TENTATIVAS_ERRO);
             if (e instanceof SemCompetencia) {
                 registrarSemCompetencia(reg);
                 registrarLog('aviso', reg.matricula, `${reg.nome}: ${e.message} — pulado e anotado na lista "Sem competência"`);
