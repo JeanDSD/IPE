@@ -16,3 +16,7 @@ Script Tampermonkey que cruza o CSV da rubrica (ex.: `R963_202509.csv`) com o PD
 Regras: titular 67,73% com o valor do PDF. Dependentes com 0%, "filho ou enteado" se
 tiverem menos de 18 anos e "cônjuge" se tiverem 18 ou mais. Titular + dependentes do PDF
 precisam somar exatamente o valor do CSV, senão a matrícula vai para os erros.
+
+Falhas passageiras não pausam o robô: erro interno do e-cidade (janela com "Uncaught exception"
+e botão OK) é repetido até 3 vezes, e valor que não gravou (ex.: tela mostra 0,00 depois de
+salvar) até 5 vezes. Se persistir, a matrícula vai para **⬇ Pendências** e o robô segue.

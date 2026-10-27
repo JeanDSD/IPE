@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.8
+// @version      6.9
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -18,12 +18,15 @@
     const TEMPO_LOOP = 1000;
     const TEMPO_ESPERA_MATRICULA = 1500;   // estabilização após carregar matrícula/competência
     const TEMPO_ESPERA_CAMPO = 300;        // após preencher um campo, antes de conferir
-    const TEMPO_ESPERA_POS_SALVAR = 1000;
-    const TEMPO_LIMITE = 15000;            // limite das esperas dinâmicas (aba, popup, carregamento)
+    const TEMPO_LIMITE = 15000;            // limite das esperas dinâmicas (aba, popup, carregamento, salvar)
     const TEMPO_LIMITE_SALVAR = 20000;     // limite para o dependente aparecer no grid após salvar
     const TEMPO_LIMITE_COMPETENCIA = 6000; // sem a competência na lista nesse tempo: servidor é pulado
     const TEMPO_LIMITE_POPUP = 8000;       // espera por tentativa de abrir o popup de dependentes
+    const TEMPO_LIMITE_CONFERENCIA = 10000; // espera o valor gravado aparecer na tela após salvar
+    const TEMPO_LIMITE_REDE = 10000;       // espera o e-cidade terminar as requisições (AJAX) da tela
+    const TEMPO_REDE_PARADA = 500;         // sem requisições por esse tempo = e-cidade terminou de carregar
     const TENTATIVAS_ERRO_SISTEMA = 3;     // erro interno do e-cidade: tentativas na mesma matrícula
+    const TENTATIVAS_CONFERENCIA = 5;      // valor que não gravou/não ficou na tela: tentativas na mesma matrícula
     const TENTATIVAS_POPUP = 3;            // cliques no link "Dependente:" antes de virar pendência
 
     // =========================================================================
@@ -471,9 +474,15 @@
     // fecha o popup e segue para o próximo servidor (não pausa o robô)
     class Pendencia extends Error {}
 
-    // Erro interno do e-cidade (exceção PHP) num alert: o alert já foi respondido (OK);
-    // o robô repete a matrícula e, se persistir, anota em "Pendências" e segue
-    class ErroSistema extends Error {}
+    // Falha passageira: o robô repete a mesma matrícula (sem pausar) e, se persistir, anota em
+    // "Pendências" e segue
+    class Repetir extends Error {}
+
+    // Erro interno do e-cidade (exceção PHP) num alert ou janela: o OK já foi dado
+    class ErroSistema extends Repetir {}
+
+    // A tela não mostra o que o robô preencheu/salvou (ex: valor 0,00 depois de salvar)
+    class ConferenciaFalhou extends Repetir {}
 
     const REGEX_ERRO_SISTEMA = /uncaught exception|call to a member function|fatal error|stack trace|exception '|on line \d+|\.php\b|erro interno/i;
 
@@ -527,6 +536,55 @@
             } catch (e) { /* sem observer, fica só o polling */ }
             checar();
         });
+    }
+
+    // Conta as requisições AJAX em andamento na tela (XMLHttpRequest e fetch), para o robô saber
+    // quando o e-cidade terminou de carregar ou gravar
+    function instalarContadorRede(win) {
+        try {
+            if (!win || win.__ecpsRede) return;
+            let estado = { pendentes: 0 };
+            win.__ecpsRede = estado;
+            let proto = win.XMLHttpRequest && win.XMLHttpRequest.prototype;
+            if (proto && proto.send) {
+                let enviar = proto.send;
+                proto.send = function() {
+                    let terminou = false;
+                    const fim = () => { if (!terminou) { terminou = true; estado.pendentes--; } };
+                    estado.pendentes++;
+                    try { this.addEventListener('loadend', fim); } catch (e) { fim(); }
+                    try { return enviar.apply(this, arguments); } catch (e) { fim(); throw e; }
+                };
+            }
+            if (typeof win.fetch === 'function') {
+                let buscar = win.fetch;
+                win.fetch = function() {
+                    const fim = () => { estado.pendentes--; };
+                    estado.pendentes++;
+                    try {
+                        let p = buscar.apply(this || win, arguments);
+                        p.then(fim, fim);
+                        return p;
+                    } catch (e) { fim(); throw e; }
+                };
+            }
+        } catch (e) { /* sem contador: as esperas viram só o limite de tempo */ }
+    }
+    instalarContadorRede(window);
+
+    function requisicoesPendentes() {
+        return window.__ecpsRede ? window.__ecpsRede.pendentes : 0;
+    }
+
+    // Espera a tela ficar sem requisições por um instante; se não parar no limite, segue assim
+    // mesmo (as conferências depois pegam o problema)
+    async function esperarRedeOciosa() {
+        let paradaDesde = null;
+        await esperarAte(() => {
+            if (requisicoesPendentes() > 0) { paradaDesde = null; return false; }
+            if (paradaDesde === null) paradaDesde = Date.now();
+            return Date.now() - paradaDesde >= TEMPO_REDE_PARADA;
+        }, 'o e-cidade terminar de carregar', TEMPO_LIMITE_REDE).catch(relancarErroSistema);
     }
 
     function textoNorm(texto) {
@@ -857,7 +915,7 @@
     // =========================================================================
     function conferirCampo(campo, esperado, descricao) {
         if (!campo.value.trim() || parseCentavos(campo.value) !== parseCentavos(esperado)) {
-            throw new Error(`Conferência falhou: ${descricao} deveria ser "${esperado}", mas a tela mostra "${campo.value}"`);
+            throw new ConferenciaFalhou(`Conferência falhou: ${descricao} deveria ser "${esperado}", mas a tela mostra "${campo.value}"`);
         }
     }
 
@@ -884,7 +942,7 @@
 
     function conferirTipo(select, tipo, descricao) {
         let atual = select.selectedIndex >= 0 ? select.options[select.selectedIndex].text : '';
-        if (!tipoConfere(atual, tipo)) throw new Error(`Conferência falhou: Tipo do ${descricao} deveria ser "${tipo}", mas está "${atual}"`);
+        if (!tipoConfere(atual, tipo)) throw new ConferenciaFalhou(`Conferência falhou: Tipo do ${descricao} deveria ser "${tipo}", mas está "${atual}"`);
     }
 
     function lerGridDependentes() {
@@ -1114,6 +1172,7 @@
         if (ehErroDoSistema(alerta)) throw new ErroSistema(alerta);
         if (alerta) throw new Error('Sistema recusou a matrícula: ' + alerta);
         await esperar(TEMPO_ESPERA_MATRICULA);
+        await esperarRedeOciosa();
 
         let opcaoDe = sel => Array.from(sel.options).find(o => o.text.includes(competencia) || o.value.includes(competencia));
         try {
@@ -1127,19 +1186,21 @@
             let disponiveis = c && c.tagName === 'SELECT' ? Array.from(c.options).map(o => o.text.trim()).filter(Boolean).join(', ') : '';
             throw new SemCompetencia(`Sem a competência ${competencia} (disponíveis: ${disponiveis || 'nenhuma'})`);
         }
+        // Seleciona sempre, mesmo se já estiver selecionada: assim o e-cidade (re)carrega os dados
+        // desta competência, e o robô espera esse carregamento terminar antes de ler os campos
         let campo = elementosTitular().competencia;
         if (campo.tagName === 'SELECT') {
-            let opcao = opcaoDe(campo);
-            if (campo.value !== opcao.value) {
-                campo.value = opcao.value;
-                dispararEventos(campo);
-                await esperar(TEMPO_ESPERA_MATRICULA);
-            }
-            let atual = campo.options[campo.selectedIndex];
-            if (!atual || !atual.text.includes(competencia)) throw new Error(`Conferência falhou: competência selecionada "${atual ? atual.text : ''}"`);
-        } else if (campo.value !== competencia) {
+            campo.value = opcaoDe(campo).value;
+            dispararEventos(campo);
+        } else {
             preencherCampo(campo, competencia);
-            await esperar(TEMPO_ESPERA_MATRICULA);
+        }
+        await esperar(TEMPO_ESPERA_MATRICULA);
+        await esperarRedeOciosa();
+        campo = elementosTitular().competencia;
+        if (campo.tagName === 'SELECT') {
+            let atual = campo.options[campo.selectedIndex];
+            if (!atual || !atual.text.includes(competencia)) throw new ConferenciaFalhou(`Conferência falhou: competência selecionada "${atual ? atual.text : ''}"`);
         }
     }
 
@@ -1148,13 +1209,20 @@
         exigirCampos(t, ['salvar'], 'Titular');
         lerAlerta();
         t.salvar.click();
-        await esperarAte(() => espiarAlerta(), 'resposta ao salvar', TEMPO_ESPERA_POS_SALVAR * 3).catch(() => null);
+        await esperarAte(() => espiarAlerta(), 'resposta ao salvar').catch(() => null);
         let alerta = lerAlerta();
         if (ehErroDoSistema(alerta)) throw new ErroSistema(alerta);
         if (alerta && REGEX_ALERTA_ERRO.test(alerta)) throw new Error('Sistema recusou o titular: ' + alerta);
+        await esperarRedeOciosa();
 
-        // Conferência pós-salvar: recarrega o servidor e confere o que ficou gravado
+        // Conferência pós-salvar: recarrega o servidor e espera o valor gravado aparecer na tela;
+        // se não aparecer, a conferência falha e o robô repete a matrícula
         await carregarServidor(reg, competencia);
+        await esperarAte(() => {
+            let g = elementosTitular();
+            return parseCentavos(g.valor.value) === parseCentavos(reg.titular.valor) &&
+                parseCentavos(g.percentual.value) === parseCentavos(reg.titular.percentual);
+        }, 'o valor gravado aparecer na tela', TEMPO_LIMITE_CONFERENCIA).catch(relancarErroSistema);
         let gravado = elementosTitular();
         conferirCampo(gravado.valor, reg.titular.valor, 'Valor do titular (após salvar)');
         conferirCampo(gravado.percentual, reg.titular.percentual, 'Percentual do titular (após salvar)');
@@ -1221,7 +1289,7 @@
 
         // Conferência completa antes de salvar
         e = elementosDependente();
-        if (!nomesBatem(e.nome.value, nomeSistema)) throw new Error(`Conferência falhou: dependente na tela "${e.nome.value}" ≠ "${nomeSistema}"`);
+        if (!nomesBatem(e.nome.value, nomeSistema)) throw new ConferenciaFalhou(`Conferência falhou: dependente na tela "${e.nome.value}" ≠ "${nomeSistema}"`);
         conferirTipo(e.tipo, dep.tipo, rotulo);
         conferirCampo(e.valor, dep.valor, `Valor do ${rotulo}`);
         conferirCampo(e.percentual, dep.percentual, `Percentual do ${rotulo}`);
@@ -1377,21 +1445,24 @@
             localStorage.removeItem(K_TENTATIVAS_ERRO);
             localStorage.setItem(K_INDEX, String(index + 1));
         } catch (e) {
-            if (e instanceof ErroSistema) {
+            if (e instanceof Repetir) {
                 lerAlerta();
                 fecharPopupsVisiveis();
-                let resumo = e.message.replace(/\s+/g, ' ').slice(0, 160);
+                let sistema = e instanceof ErroSistema;
+                let limite = sistema ? TENTATIVAS_ERRO_SISTEMA : TENTATIVAS_CONFERENCIA;
+                let resumo = e.message.replace(/\s+/g, ' ').slice(0, 200);
+                let motivo = sistema ? `Erro interno do e-cidade (${resumo}) — OK dado` : resumo;
                 let anterior = JSON.parse(localStorage.getItem(K_TENTATIVAS_ERRO) || '{}');
                 let n = anterior.index === index ? anterior.n + 1 : 1;
-                if (n < TENTATIVAS_ERRO_SISTEMA) {
+                if (n < limite) {
                     localStorage.setItem(K_TENTATIVAS_ERRO, JSON.stringify({ index, n }));
-                    registrarLog('aviso', reg.matricula, `Erro interno do e-cidade (${resumo}) — OK dado; tentando de novo (${n}/${TENTATIVAS_ERRO_SISTEMA})`);
+                    registrarLog('aviso', reg.matricula, `${motivo}; tentando de novo (${n}/${limite})`);
                     await esperar(3000);
                     return;
                 }
                 localStorage.removeItem(K_TENTATIVAS_ERRO);
-                registrarPendencia(reg, `Erro interno do e-cidade após ${TENTATIVAS_ERRO_SISTEMA} tentativas: ${resumo}`);
-                registrarLog('erro', reg.matricula, `Erro interno do e-cidade em ${TENTATIVAS_ERRO_SISTEMA} tentativas — anotado em "Pendências"; seguindo para o próximo`);
+                registrarPendencia(reg, `${motivo} (falhou em ${limite} tentativas)`);
+                registrarLog('erro', reg.matricula, `${motivo} — falhou em ${limite} tentativas; anotado em "Pendências", seguindo para o próximo`);
                 localStorage.setItem(K_INDEX, String(index + 1));
                 return;
             }
