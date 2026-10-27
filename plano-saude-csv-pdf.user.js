@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      6.0
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -16,13 +16,11 @@
     // CONFIGURAÇÕES DE TEMPO
     // =========================================================================
     const TEMPO_LOOP = 1000;
-    const TEMPO_ESPERA_MATRICULA = 1500;
-    const TEMPO_ESPERA_CAMPO = 300;
-    const TEMPO_ESPERA_DEPENDENTE = 1000;
+    const TEMPO_ESPERA_MATRICULA = 1500;   // estabilização após carregar matrícula/competência
+    const TEMPO_ESPERA_CAMPO = 300;        // após preencher um campo, antes de conferir
     const TEMPO_ESPERA_POS_SALVAR = 1000;
-    const TEMPO_ESPERA_POS_POPUP = 1000;
-
-    const MAX_TENTATIVAS_COMPETENCIA = 5;
+    const TEMPO_LIMITE = 15000;            // limite das esperas dinâmicas (aba, popup, carregamento)
+    const TEMPO_LIMITE_SALVAR = 20000;     // limite para o dependente aparecer no grid após salvar
 
     // =========================================================================
     // IDS / SELETORES DA TELA "PLANO DE SAÚDE" (pes1_plano_saude_servidor001.php)
@@ -33,19 +31,19 @@
     const ID_PERCENTUAL = 'percentualEmpregadorSe';
     const ID_SALVAR = 'salvarServidorOperadoraSaude';
 
-    // Campos dos dependentes. Deixe null para o robô localizar sozinho (heurística).
-    // Se a detecção automática falhar, use o botão "🔎 Diagnóstico" do painel,
-    // descubra os IDs reais e informe-os aqui (ex: '#tipoDependente').
+    // Aba "Dependentes": o robô acha os campos pelo rótulo (Dependente:, Tipo:, Valor:, Percentual
+    // Patronal Empregador:) dentro do quadro "Dependente". Só preencha se precisar forçar um ID
+    // descoberto pelo "🔎 Diagnóstico" (ex: tipo: '#tipoDependente').
     const SELETORES_DEPENDENTE = {
-        botaoAdicionar: null,   // botão que adiciona/inclui o dependente
-        tipo: null,             // <select> do tipo (filho ou enteado / cônjuge)
-        percentual: null,       // input do percentual do dependente
-        valor: null             // input do valor do dependente
+        link: null,        // link azul "Dependente:" que abre o popup de pesquisa
+        codigo: null,      // input do código do dependente
+        nome: null,        // input (somente leitura) do nome do dependente
+        tipo: null,        // <select> Tipo
+        valor: null,       // input Valor
+        percentual: null,  // input Percentual Patronal Empregador
+        salvar: null,      // botão Salvar da aba Dependentes
+        novo: null         // botão Novo da aba Dependentes
     };
-    // 'auto'                      -> detecta sozinho
-    // 'adicionar-depois-preencher'-> clica em adicionar, aparece uma linha nova, preenche a linha
-    // 'preencher-depois-adicionar'-> preenche o formulário do dependente e depois clica em adicionar
-    const MODO_DEPENDENTE = 'auto';
 
     // =========================================================================
     // REGRAS DE NEGÓCIO
@@ -55,8 +53,11 @@
     const IDADE_MAIORIDADE = 18;
     const TIPO_FILHO = 'filho ou enteado';
     const TIPO_CONJUGE = 'cônjuge';
-    const REGEX_OPCAO_FILHO = /filho|enteado/i;
-    const REGEX_OPCAO_CONJUGE = /c[oô]njuge/i;
+    // Únicas opções aceitas no <select> Tipo (comparadas sem acento e em minúsculas)
+    const OPCOES_TIPO = {
+        [TIPO_FILHO]: /^filho(\(a\))? ou enteado(\(a\))?$/,
+        [TIPO_CONJUGE]: /^conjuge$/
+    };
 
     // Chaves do localStorage (prefixo próprio para não conflitar com o robô antigo)
     const K_STATUS = 'ecps_status';
@@ -69,6 +70,7 @@
     const K_AUTO_SALVAR = 'ecps_auto_salvar';
     const K_PULAR_LANCADOS = 'ecps_pular_lancados';
     const K_RESUMO = 'ecps_resumo';
+    const K_ALERTA = 'ecps_alerta';
 
     // =========================================================================
     // <<NUCLEO>> PROCESSAMENTO DOS ARQUIVOS (funções puras, sem DOM)
@@ -283,6 +285,7 @@
                 dependentes: t.dependentes.map(d => ({
                     nome: d.nome,
                     idade: d.idade,
+                    nascimento: d.nascimento,
                     tipo: tipoDependentePorIdade(d.idade),
                     percentual: PERCENTUAL_DEPENDENTE,
                     valor: formatCentavos(d.contribuicao)
@@ -424,6 +427,53 @@
     // FUNÇÕES AUXILIARES DE DOM
     // =========================================================================
     const esperar = ms => new Promise(r => setTimeout(r, ms));
+    const REGEX_ALERTA_ERRO = /erro|inv[aá]lid|obrigat|n[aã]o foi|n[aã]o pode|falha|j[aá] existe|j[aá] cadastrad/i;
+
+    // Pausa "boa": o robô preencheu e espera o usuário revisar e salvar (modo sem Salvar automático)
+    class PausaRevisao extends Error {}
+
+    function checarParada() {
+        if (localStorage.getItem(K_STATUS) !== 'rodando') throw new Error('Interrompido pelo usuário (⏸ Parar)');
+    }
+
+    // Espera dinâmica: reavalia a condição a cada mudança no DOM (MutationObserver) e a cada 200 ms
+    // (o polling cobre valores de inputs e iframes novos, que não geram mutação aqui).
+    function esperarAte(condicao, descricao, timeout = TEMPO_LIMITE) {
+        return new Promise((resolve, reject) => {
+            let terminado = false;
+            let observador = null;
+            let intervalo = null;
+            let limite = null;
+            const encerrar = () => {
+                terminado = true;
+                if (observador) observador.disconnect();
+                clearInterval(intervalo);
+                clearTimeout(limite);
+            };
+            const checar = () => {
+                if (terminado) return;
+                let r = null;
+                try { r = condicao(); } catch (e) { r = null; }
+                if (r) { encerrar(); resolve(r); }
+            };
+            intervalo = setInterval(checar, 200);
+            limite = setTimeout(() => {
+                if (terminado) return;
+                encerrar();
+                reject(new Error('Tempo esgotado aguardando: ' + descricao));
+            }, timeout);
+            try {
+                observador = new MutationObserver(checar);
+                observador.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: true });
+            } catch (e) { /* sem observer, fica só o polling */ }
+            checar();
+        });
+    }
+
+    function textoNorm(texto) {
+        return (texto || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+            .toLowerCase().replace(/\s+/g, ' ').trim();
+    }
 
     function dispararEventos(elemento) {
         elemento.dispatchEvent(new Event('input', { bubbles: true }));
@@ -450,255 +500,564 @@
         return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
     }
 
-    // Documento atual + iframes internos do mesmo domínio (janelas auxiliares do e-cidade)
-    function documentosAcessiveis(doc = document, acc = []) {
-        acc.push(doc);
-        for (let f of doc.querySelectorAll('iframe, frame')) {
-            try { if (f.contentDocument) documentosAcessiveis(f.contentDocument, acc); } catch (e) { /* outro domínio */ }
+    // Documento do Plano de Saúde + iframes internos (popups) + janela do topo e seus iframes
+    function documentosAcessiveis() {
+        let lista = [];
+        const visitar = doc => {
+            if (!doc || lista.includes(doc)) return;
+            lista.push(doc);
+            for (let f of doc.querySelectorAll('iframe, frame')) {
+                try { visitar(f.contentDocument); } catch (e) { /* outro domínio */ }
+            }
+        };
+        visitar(document);
+        try { visitar(window.top.document); } catch (e) { /* topo inacessível */ }
+        return lista;
+    }
+
+    function frameVisivel(doc) {
+        if (doc === document) return true;
+        try {
+            let frame = doc.defaultView && doc.defaultView.frameElement;
+            return !frame || visivel(frame);
+        } catch (e) {
+            return false;
         }
-        return acc;
     }
 
-    function buscar(seletor) {
-        for (let d of documentosAcessiveis()) {
-            let el = d.querySelector(seletor);
-            if (el) return el;
-        }
-        return null;
+    function nomesBatem(a, b) {
+        let na = normalizarNome(a);
+        let nb = normalizarNome(b);
+        if (!na || !nb) return false;
+        if (na === nb) return true;
+        if (Math.min(na.length, nb.length) >= 20 && (na.startsWith(nb) || nb.startsWith(na))) return true; // nome cortado no CSV
+        return nomesCompativeis(a, b) || nomesCompativeis(b, a) || nomesSemelhantes(a, b);
     }
 
-    function textoElemento(el) {
-        return normalizarNome(el.value || el.textContent || el.title || '').toLowerCase();
+    // Prefere casamento estrito (igual/abreviado); só usa o aproximado se o estrito não achar nada
+    function filtrarPorNome(lista, nomeDe, nome) {
+        let estritos = lista.filter(l => {
+            let n = nomeDe(l);
+            return normalizarNome(n) === normalizarNome(nome) || nomesCompativeis(n, nome) || nomesCompativeis(nome, n);
+        });
+        return estritos.length ? estritos : lista.filter(l => nomesBatem(nomeDe(l), nome));
     }
 
-    function selecionarOpcao(select, regex) {
-        let opcao = Array.from(select.options).find(o => regex.test(o.text.normalize('NFC')) || regex.test(o.value));
-        if (!opcao) return false;
-        select.value = opcao.value;
-        dispararEventos(select);
-        return true;
-    }
-
-    function selecionarCompetencia(idCampo, competenciaDesejada) {
-        let campoCompetencia = document.getElementById(idCampo);
-        if (!campoCompetencia || !competenciaDesejada) return false;
-        let encontrou = false;
-
-        if (campoCompetencia.tagName === 'SELECT') {
-            let opcoes = Array.from(campoCompetencia.options);
-            let optionAlvo = opcoes.find(opt => opt.text.includes(competenciaDesejada) || opt.value.includes(competenciaDesejada));
-            if (optionAlvo) {
-                if (campoCompetencia.value !== optionAlvo.value) {
-                    campoCompetencia.value = optionAlvo.value;
-                    encontrou = true;
-                } else {
-                    return true;
+    // =========================================================================
+    // CAPTURA DE ALERT (todas as janelas acessíveis, inclusive popups)
+    // =========================================================================
+    // Guardado no localStorage para que o alerta de qualquer frame chegue ao robô
+    function instalarCapturaAlerta(win) {
+        try {
+            if (!win || win.__ecpsAlertaOriginal) return;
+            let original = win.alert;
+            win.alert = function(msg) {
+                if (localStorage.getItem(K_STATUS) === 'rodando') {
+                    localStorage.setItem(K_ALERTA, String(msg));
+                    console.log('[Robô Plano de Saúde] alert capturado:', msg);
+                    return;
                 }
-            }
-        } else {
-            if (campoCompetencia.value !== competenciaDesejada) {
-                campoCompetencia.value = competenciaDesejada;
-                encontrou = true;
-            } else {
-                return true;
-            }
-        }
+                return original.call(win, msg);
+            };
+            win.__ecpsAlertaOriginal = original;
+        } catch (e) { /* janela inacessível */ }
+    }
+    instalarCapturaAlerta(window);
+    const alertOriginal = window.__ecpsAlertaOriginal || window.alert;
 
-        if (encontrou) { dispararEventos(campoCompetencia); }
-        return encontrou;
+    function protegerAlertasDosFrames() {
+        documentosAcessiveis().forEach(d => instalarCapturaAlerta(d.defaultView));
     }
 
-    // Captura os alert() do e-cidade enquanto o robô roda, para não travar o loop
-    let ultimoAlerta = null;
-    const alertOriginal = window.alert;
-    window.alert = function(msg) {
-        if (localStorage.getItem(K_STATUS) === 'rodando') {
-            ultimoAlerta = String(msg);
-            console.log('[Robô Plano de Saúde] alert capturado:', msg);
-            return;
-        }
-        return alertOriginal.call(window, msg);
-    };
+    function espiarAlerta() {
+        return localStorage.getItem(K_ALERTA);
+    }
+
+    function lerAlerta() {
+        let a = localStorage.getItem(K_ALERTA);
+        localStorage.removeItem(K_ALERTA);
+        return a;
+    }
 
     function alertaPainel(msg) {
         alertOriginal.call(window, msg);
     }
 
     // =========================================================================
-    // LOCALIZAÇÃO DOS CAMPOS DE DEPENDENTE
+    // LOCALIZAÇÃO DOS ELEMENTOS (por legenda do fieldset e rótulo do campo)
     // =========================================================================
-    function selectsDeTipoDependente() {
-        let lista = [];
-        for (let d of documentosAcessiveis()) {
-            for (let s of d.querySelectorAll('select')) {
-                if (!visivel(s)) continue;
-                let textos = Array.from(s.options).map(o => o.text);
-                if (textos.some(t => REGEX_OPCAO_FILHO.test(t)) && textos.some(t => REGEX_OPCAO_CONJUGE.test(t))) lista.push(s);
-            }
-        }
-        return lista;
+    function fieldsetPorLegenda(legenda, doc = document) {
+        let alvo = textoNorm(legenda);
+        return Array.from(doc.querySelectorAll('fieldset')).find(fs => {
+            let lg = Array.from(fs.children).find(c => c.tagName === 'LEGEND');
+            return lg && textoNorm(lg.textContent) === alvo && visivel(fs);
+        }) || null;
     }
 
-    function localizarBotaoAdicionarDependente() {
-        if (SELETORES_DEPENDENTE.botaoAdicionar) return buscar(SELETORES_DEPENDENTE.botaoAdicionar);
-        let candidatos = [];
-        for (let d of documentosAcessiveis()) {
-            candidatos.push(...d.querySelectorAll('button, input[type=button], input[type=submit], a, [onclick]'));
+    // Acha o rótulo (td/th/label) com o texto e devolve os campos que vêm depois dele na mesma linha
+    function camposAposRotulo(escopo, rotulo) {
+        if (!escopo) return [];
+        let alvo = textoNorm(rotulo).replace(/:$/, '');
+        let rotulos = Array.from(escopo.querySelectorAll('td, th, label'))
+            .filter(el => textoNorm(el.textContent).replace(/:$/, '') === alvo && !el.querySelector('input, select, textarea'));
+        for (let r of rotulos) {
+            let celula = r.closest('td, th') || r;
+            let linha = celula.closest('tr');
+            let candidatos = linha ? Array.from(linha.querySelectorAll('input, select, textarea')) : [];
+            if (!linha && r.htmlFor) {
+                let el = escopo.ownerDocument.getElementById(r.htmlFor);
+                if (el) candidatos = [el];
+            }
+            let depois = candidatos.filter(c => (celula.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+                !['hidden', 'button', 'submit'].includes(c.type));
+            if (depois.length) return depois;
         }
-        candidatos = candidatos.filter(b => visivel(b) && b.id !== ID_SALVAR && !b.closest('#painel-ecps'));
-        let porDependente = candidatos.find(b => /(adicionar|incluir|novo|lancar|\+).*dependente|dependente.*(adicionar|incluir|novo)/.test(textoElemento(b) + ' ' + (b.id || '').toLowerCase()));
-        if (porDependente) return porDependente;
-        return candidatos.find(b => /dependente/i.test((b.id || '') + ' ' + (b.name || '') + ' ' + textoElemento(b))) || null;
+        return [];
     }
 
-    // A partir do <select> de tipo, acha percentual e valor na mesma linha/bloco
-    function camposDoDependente(selectTipo) {
-        let tipo = SELETORES_DEPENDENTE.tipo ? buscar(SELETORES_DEPENDENTE.tipo) : selectTipo;
-        let percentual = SELETORES_DEPENDENTE.percentual ? buscar(SELETORES_DEPENDENTE.percentual) : null;
-        let valor = SELETORES_DEPENDENTE.valor ? buscar(SELETORES_DEPENDENTE.valor) : null;
-        if (tipo && (!percentual || !valor)) {
-            let container = tipo.closest('tr') || tipo.parentElement;
-            while (container && (!percentual || !valor)) {
-                let inputs = Array.from(container.querySelectorAll('input[type=text], input:not([type])'))
-                    .filter(i => visivel(i) && i.id !== ID_VALOR && i.id !== ID_PERCENTUAL && !i.closest('#painel-ecps'));
-                let idNome = i => ((i.id || '') + ' ' + (i.name || '')).toLowerCase();
-                percentual = percentual || inputs.find(i => /percent|perc/.test(idNome(i)));
-                valor = valor || inputs.find(i => /valor|vlr/.test(idNome(i)));
-                if (container.tagName === 'FORM' || container.tagName === 'BODY') break;
-                container = container.parentElement;
-            }
-        }
-        return { tipo, percentual, valor };
+    function botaoNoDoc(doc, texto) {
+        let alvo = textoNorm(texto);
+        return Array.from(doc.querySelectorAll('input[type=button], input[type=submit], button'))
+            .find(b => visivel(b) && textoNorm(b.value || b.textContent) === alvo && !b.closest('#painel-ecps')) || null;
     }
 
-    async function lancarDependente(dep, ordem, matricula) {
-        let regexTipo = dep.tipo === TIPO_FILHO ? REGEX_OPCAO_FILHO : REGEX_OPCAO_CONJUGE;
-        let antes = selectsDeTipoDependente();
-        let modo = MODO_DEPENDENTE;
-        if (modo === 'auto') {
-            // Se já existe um formulário de dependente vazio na tela, é "preencher e depois adicionar"
-            let vazio = antes.find(s => !s.value || s.selectedIndex <= 0);
-            modo = (vazio || SELETORES_DEPENDENTE.tipo) ? 'preencher-depois-adicionar' : 'adicionar-depois-preencher';
-        }
+    // Primeiro botão visível com o texto que fica dentro ou logo depois do fieldset
+    function botaoApos(fs, texto) {
+        if (!fs) return null;
+        let alvo = textoNorm(texto);
+        return Array.from(fs.ownerDocument.querySelectorAll('input[type=button], input[type=submit], button'))
+            .filter(b => visivel(b) && textoNorm(b.value || b.textContent) === alvo && !b.closest('#painel-ecps'))
+            .find(b => fs.contains(b) || (fs.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)) || null;
+    }
 
-        let botao = localizarBotaoAdicionarDependente();
-        let alvo;
-        if (modo === 'adicionar-depois-preencher') {
-            if (!botao) throw new Error('Botão de adicionar dependente não encontrado');
-            botao.click();
-            await esperar(TEMPO_ESPERA_DEPENDENTE);
-            let depois = selectsDeTipoDependente();
-            alvo = depois.find(s => !antes.includes(s)) || depois[depois.length - 1];
-        } else {
-            alvo = antes.find(s => !s.value || s.selectedIndex <= 0) || antes[antes.length - 1];
+    // Lê uma tabela: acha a linha de cabeçalho (com as colunas pedidas) e devolve as linhas seguintes
+    // como objetos { 'nome': ..., 'tipo': ..., _tr, _cel }
+    function lerTabela(escopo, colunasObrigatorias) {
+        if (!escopo) return null;
+        let trs = Array.from(escopo.querySelectorAll('tr'));
+        let iCab = trs.findIndex(tr => {
+            let textos = Array.from(tr.cells).map(c => textoNorm(c.textContent));
+            return colunasObrigatorias.every(col => textos.includes(col));
+        });
+        if (iCab < 0) return null;
+        let cab = Array.from(trs[iCab].cells).map(c => textoNorm(c.textContent));
+        let linhas = [];
+        for (let tr of trs.slice(iCab + 1)) {
+            if (tr.cells.length < cab.length) continue;
+            let obj = { _tr: tr, _cel: {} };
+            let algumTexto = false;
+            cab.forEach((col, i) => {
+                let celula = tr.cells[i];
+                obj[col] = (celula.textContent || '').replace(/\s+/g, ' ').trim();
+                obj._cel[col] = celula;
+                if (obj[col]) algumTexto = true;
+            });
+            if (algumTexto) linhas.push(obj);
         }
-        if (!alvo && !SELETORES_DEPENDENTE.tipo) throw new Error(`Campo "Tipo" do dependente ${ordem} não encontrado`);
+        return linhas;
+    }
 
-        let campos = camposDoDependente(alvo);
-        if (!campos.tipo || !campos.percentual || !campos.valor) {
-            throw new Error(`Campos do dependente ${ordem} incompletos (tipo:${!!campos.tipo} percentual:${!!campos.percentual} valor:${!!campos.valor})`);
-        }
-        if (!selecionarOpcao(campos.tipo, regexTipo)) throw new Error(`Opção "${dep.tipo}" não existe no select`);
+    function localizarAba(nome) {
+        let alvo = textoNorm(nome);
+        let candidatos = Array.from(document.querySelectorAll('a, li, td, th, div, span, button, input[type=button]'))
+            .filter(el => visivel(el) && !el.closest('fieldset') && !el.closest('#painel-ecps') &&
+                textoNorm(el.tagName === 'INPUT' ? el.value : el.textContent) === alvo);
+        // fica com o elemento mais interno (o próprio texto da aba)
+        return candidatos.find(el => !candidatos.some(o => o !== el && el.contains(o))) || null;
+    }
+
+    async function irParaAba(nomeAba, legendaFormulario) {
+        if (fieldsetPorLegenda(legendaFormulario)) return;
+        let aba = localizarAba(nomeAba);
+        if (!aba) throw new Error(`Aba "${nomeAba}" não encontrada na tela`);
+        aba.click();
+        await esperarAte(() => fieldsetPorLegenda(legendaFormulario), `abrir a aba "${nomeAba}"`);
         await esperar(TEMPO_ESPERA_CAMPO);
-        preencherCampo(campos.percentual, dep.percentual);
-        await esperar(TEMPO_ESPERA_CAMPO);
-        preencherCampo(campos.valor, dep.valor);
-        await esperar(TEMPO_ESPERA_CAMPO);
+    }
 
-        let tipoOk = regexTipo.test(campos.tipo.options[campos.tipo.selectedIndex].text);
-        if (!tipoOk || parseCentavos(campos.valor.value) !== parseCentavos(dep.valor) || parseCentavos(campos.percentual.value) !== parseCentavos(dep.percentual)) {
-            throw new Error(`Conferência do dependente ${ordem} (${dep.nome}) falhou`);
+    function porSeletor(chave) {
+        let s = SELETORES_DEPENDENTE[chave];
+        return s ? document.querySelector(s) : null;
+    }
+
+    function elementosTitular() {
+        let fs = fieldsetPorLegenda('Plano de Saúde do Servidor');
+        let servidor = camposAposRotulo(fs, 'Servidor');
+        let competencia = document.getElementById(ID_COMPETENCIA);
+        if (!competencia || competencia.tagName !== 'SELECT') {
+            competencia = camposAposRotulo(fs, 'Competência').find(c => c.tagName === 'SELECT') || competencia;
         }
+        return {
+            fieldset: fs,
+            codigo: document.getElementById(ID_CODIGO) || servidor[0] || null,
+            nome: servidor[1] || null,
+            competencia: competencia || null,
+            valor: document.getElementById(ID_VALOR) || camposAposRotulo(fs, 'Valor')[0] || null,
+            percentual: document.getElementById(ID_PERCENTUAL) || camposAposRotulo(fs, 'Percentual Patronal Empregador')[0] || null,
+            salvar: document.getElementById(ID_SALVAR) || botaoApos(fs, 'Salvar')
+        };
+    }
 
-        if (modo === 'preencher-depois-adicionar') {
-            if (!botao) throw new Error('Botão de adicionar dependente não encontrado');
-            botao.click();
-            await esperar(TEMPO_ESPERA_DEPENDENTE);
-            if (ultimoAlerta) {
-                registrarLog('aviso', matricula, `Ao adicionar dependente ${ordem}: ${ultimoAlerta}`);
-                ultimoAlerta = null;
-            }
+    function elementosDependente() {
+        let fs = fieldsetPorLegenda('Dependente');
+        let dependente = camposAposRotulo(fs, 'Dependente');
+        let link = fs ? Array.from(fs.querySelectorAll('a')).find(a => textoNorm(a.textContent).replace(/:$/, '') === 'dependente') : null;
+        return {
+            fieldset: fs,
+            link: porSeletor('link') || link || null,
+            codigo: porSeletor('codigo') || dependente[0] || null,
+            nome: porSeletor('nome') || dependente[1] || null,
+            tipo: porSeletor('tipo') || camposAposRotulo(fs, 'Tipo').find(c => c.tagName === 'SELECT') || null,
+            valor: porSeletor('valor') || camposAposRotulo(fs, 'Valor')[0] || null,
+            percentual: porSeletor('percentual') || camposAposRotulo(fs, 'Percentual Patronal Empregador')[0] || null,
+            salvar: porSeletor('salvar') || botaoApos(fs, 'Salvar'),
+            novo: porSeletor('novo') || botaoApos(fs, 'Novo')
+        };
+    }
+
+    function exigirCampos(obj, chaves, contexto) {
+        let faltando = chaves.filter(k => !obj[k]);
+        if (faltando.length) {
+            throw new Error(`${contexto}: não encontrei na tela: ${faltando.join(', ')} (envie o 🔎 Diagnóstico)`);
         }
     }
 
     // =========================================================================
-    // ROBÔ: PROCESSA UMA MATRÍCULA
+    // CONFERÊNCIAS
+    // =========================================================================
+    function conferirCampo(campo, esperado, descricao) {
+        if (!campo.value.trim() || parseCentavos(campo.value) !== parseCentavos(esperado)) {
+            throw new Error(`Conferência falhou: ${descricao} deveria ser "${esperado}", mas a tela mostra "${campo.value}"`);
+        }
+    }
+
+    async function preencherEConferir(campo, valor, descricao) {
+        preencherCampo(campo, valor);
+        await esperar(TEMPO_ESPERA_CAMPO);
+        conferirCampo(campo, valor, descricao);
+    }
+
+    function tipoConfere(texto, tipo) {
+        return OPCOES_TIPO[tipo].test(textoNorm(texto));
+    }
+
+    // Seleciona SOMENTE "Filho(a) ou enteado(a)" ou "Cônjuge"; qualquer outra situação pausa
+    function selecionarTipo(select, tipo, descricao) {
+        let opcoes = Array.from(select.options).filter(o => tipoConfere(o.text, tipo));
+        if (opcoes.length !== 1) {
+            throw new Error(`${descricao}: opção "${tipo}" não encontrada (ou repetida) no campo Tipo. Opções: ${Array.from(select.options).map(o => o.text.trim()).join(' | ')}`);
+        }
+        select.value = opcoes[0].value;
+        dispararEventos(select);
+        conferirTipo(select, tipo, descricao);
+    }
+
+    function conferirTipo(select, tipo, descricao) {
+        let atual = select.selectedIndex >= 0 ? select.options[select.selectedIndex].text : '';
+        if (!tipoConfere(atual, tipo)) throw new Error(`Conferência falhou: Tipo do ${descricao} deveria ser "${tipo}", mas está "${atual}"`);
+    }
+
+    function lerGridDependentes() {
+        let fs = fieldsetPorLegenda('Dependentes do Servidor');
+        return (lerTabela(fs, ['nome', 'tipo']) || []).map(l => ({
+            nome: l['nome'], tipo: l['tipo'], valor: l['valor'], percentual: l['percentual e.']
+        }));
+    }
+
+    // Espera o grid carregar e ficar estável (2 leituras iguais seguidas)
+    async function lerGridDependentesEstavel() {
+        await esperarAte(() => {
+            let fs = fieldsetPorLegenda('Dependentes do Servidor');
+            return fs && /total de registros/.test(textoNorm(fs.textContent));
+        }, 'o grid "Dependentes do Servidor" carregar');
+        let anterior = null;
+        for (let i = 0; i < 10; i++) {
+            await esperar(400);
+            let atual = lerGridDependentes();
+            let assinatura = JSON.stringify(atual.map(l => [l.nome, l.tipo, l.valor, l.percentual]));
+            if (assinatura === anterior) return atual;
+            anterior = assinatura;
+        }
+        return lerGridDependentes();
+    }
+
+    function situacaoNoGrid(grid, nome, dep) {
+        let linhas = filtrarPorNome(grid, l => l.nome, nome);
+        if (!linhas.length) return { status: 'ausente' };
+        if (linhas.length > 1) return { status: 'ambiguo', linhas };
+        let l = linhas[0];
+        let igual = tipoConfere(l.tipo, dep.tipo) && parseCentavos(l.valor) === parseCentavos(dep.valor) &&
+            (l.percentual === undefined || parseCentavos(l.percentual) === parseCentavos(dep.percentual));
+        return { status: igual ? 'igual' : 'diferente', linha: l };
+    }
+
+    function descreverLinhaGrid(l) {
+        return `${l.nome}: ${l.tipo}, ${l.valor}, ${l.percentual || '?'}`;
+    }
+
+    // =========================================================================
+    // POPUP "PESQUISAR DEPENDENTES"
+    // =========================================================================
+    function acharPopupDependentes() {
+        for (let d of documentosAcessiveis()) {
+            if (d === document || !d.body || !frameVisivel(d)) continue;
+            let linhas = lerTabela(d.body, ['nome do dependente']);
+            if (linhas === null) continue;
+            let semRegistros = /retornados 0 registro|nenhum registro/.test(textoNorm(d.body.textContent));
+            if (linhas.length || semRegistros) return { doc: d, linhas };
+        }
+        return null;
+    }
+
+    function fecharPopup(popup) {
+        try {
+            let fechar = botaoNoDoc(popup.doc, 'Fechar');
+            if (fechar) fechar.click();
+        } catch (e) { /* popup já fechado */ }
+    }
+
+    async function escolherNoPopup(popup, dep, reg, rotulo) {
+        for (let pagina = 1; pagina <= 10; pagina++) {
+            let doServidor = popup.linhas.filter(l => !l['matricula do servidor'] || l['matricula do servidor'] === reg.matricula);
+            let porNome = filtrarPorNome(doServidor, l => l['nome do dependente'], dep.nome);
+            let candidatos = dep.nascimento
+                ? porNome.filter(l => !l['data de nascimento'] || l['data de nascimento'] === dep.nascimento)
+                : porNome;
+            if (candidatos.length === 1) return candidatos[0];
+            if (candidatos.length > 1) {
+                fecharPopup(popup);
+                throw new Error(`${rotulo}: ${candidatos.length} registros possíveis no popup (${candidatos.map(l => l['codigo'] + ' ' + l['nome do dependente']).join(', ')})`);
+            }
+            if (porNome.length) {
+                fecharPopup(popup);
+                throw new Error(`${rotulo}: nome achado no popup, mas a data de nascimento não confere (PDF ${dep.nascimento} x sistema ${porNome.map(l => l['data de nascimento']).join(', ')})`);
+            }
+            let proximo = botaoNoDoc(popup.doc, 'Próximo');
+            if (!proximo || proximo.disabled) break;
+            let assinatura = popup.linhas.map(l => l._tr.textContent).join('|');
+            proximo.click();
+            popup = await esperarAte(() => {
+                let p = acharPopupDependentes();
+                return p && p.linhas.map(l => l._tr.textContent).join('|') !== assinatura ? p : null;
+            }, 'a próxima página do popup');
+        }
+        let listados = popup.linhas.map(l => l['nome do dependente']).join(', ');
+        fecharPopup(popup);
+        throw new Error(`${rotulo} não encontrado no popup "Pesquisar Dependentes" (listados: ${listados || 'nenhum'})`);
+    }
+
+    function clicarLinhaPopup(linha) {
+        let celula = linha._cel['nome do dependente'] || linha._tr.cells[0];
+        let alvo = celula.querySelector('a') || linha._tr.querySelector('a') || celula;
+        alvo.click();
+    }
+
+    // =========================================================================
+    // ROBÔ: TITULAR
+    // =========================================================================
+    async function carregarServidor(reg, competencia) {
+        let t = elementosTitular();
+        exigirCampos(t, ['codigo', 'competencia'], 'Titular');
+        lerAlerta();
+        preencherCampo(t.codigo, reg.matricula);
+        dispararEnter(t.codigo);
+        try {
+            await esperarAte(() => {
+                if (espiarAlerta()) return true;
+                let n = elementosTitular().nome;
+                return !n || (n.value.trim() && nomesBatem(n.value, reg.nome));
+            }, `carregar a matrícula ${reg.matricula}`);
+        } catch (e) {
+            let n = elementosTitular().nome;
+            throw new Error(`Nome do servidor na tela ("${n ? n.value : ''}") não confere com o CSV ("${reg.nome}")`);
+        }
+        let alerta = lerAlerta();
+        if (alerta) throw new Error('Sistema recusou a matrícula: ' + alerta);
+        await esperar(TEMPO_ESPERA_MATRICULA);
+
+        let opcaoDe = sel => Array.from(sel.options).find(o => o.text.includes(competencia) || o.value.includes(competencia));
+        await esperarAte(() => {
+            let c = elementosTitular().competencia;
+            return c && (c.tagName !== 'SELECT' || opcaoDe(c));
+        }, `a competência ${competencia} aparecer na lista`);
+        let campo = elementosTitular().competencia;
+        if (campo.tagName === 'SELECT') {
+            let opcao = opcaoDe(campo);
+            if (campo.value !== opcao.value) {
+                campo.value = opcao.value;
+                dispararEventos(campo);
+                await esperar(TEMPO_ESPERA_MATRICULA);
+            }
+            let atual = campo.options[campo.selectedIndex];
+            if (!atual || !atual.text.includes(competencia)) throw new Error(`Conferência falhou: competência selecionada "${atual ? atual.text : ''}"`);
+        } else if (campo.value !== competencia) {
+            preencherCampo(campo, competencia);
+            await esperar(TEMPO_ESPERA_MATRICULA);
+        }
+    }
+
+    async function salvarTitular(reg, competencia) {
+        let t = elementosTitular();
+        exigirCampos(t, ['salvar'], 'Titular');
+        lerAlerta();
+        t.salvar.click();
+        await esperarAte(() => espiarAlerta(), 'resposta ao salvar', TEMPO_ESPERA_POS_SALVAR * 3).catch(() => null);
+        let alerta = lerAlerta();
+        if (alerta && REGEX_ALERTA_ERRO.test(alerta)) throw new Error('Sistema recusou o titular: ' + alerta);
+
+        // Conferência pós-salvar: recarrega o servidor e confere o que ficou gravado
+        await carregarServidor(reg, competencia);
+        let gravado = elementosTitular();
+        conferirCampo(gravado.valor, reg.titular.valor, 'Valor do titular (após salvar)');
+        conferirCampo(gravado.percentual, reg.titular.percentual, 'Percentual do titular (após salvar)');
+        registrarLog('ok', reg.matricula, `Titular salvo e conferido (R$ ${reg.titular.valor} / ${reg.titular.percentual}%)` +
+            (alerta ? ` — Sistema: ${alerta}` : ''));
+    }
+
+    // =========================================================================
+    // ROBÔ: DEPENDENTE (aba "Dependentes")
+    // =========================================================================
+    async function lancarDependente(dep, ordem, reg, autoSalvar) {
+        let rotulo = `dependente ${ordem} (${dep.nome})`;
+        let e = elementosDependente();
+        exigirCampos(e, ['link', 'codigo', 'nome', 'tipo', 'valor', 'percentual', 'salvar'], rotulo);
+
+        // 1. Formulário limpo
+        if (e.codigo.value.trim() || e.nome.value.trim()) {
+            if (!e.novo) throw new Error(`${rotulo}: formulário com dados e botão "Novo" não encontrado`);
+            e.novo.click();
+            await esperarAte(() => {
+                let x = elementosDependente();
+                return x.codigo && !x.codigo.value.trim() && !x.nome.value.trim();
+            }, 'limpar o formulário do dependente (Novo)');
+        }
+
+        // 2. Link azul "Dependente:" -> popup "Pesquisar Dependentes"
+        elementosDependente().link.click();
+        let popup = await esperarAte(acharPopupDependentes, 'o popup "Pesquisar Dependentes" carregar');
+        protegerAlertasDosFrames();
+        let linha = await escolherNoPopup(popup, dep, reg, rotulo);
+        let nomeSistema = linha['nome do dependente'];
+        let codigoSistema = linha['codigo'] || '';
+        clicarLinhaPopup(linha);
+        await esperarAte(() => {
+            let x = elementosDependente();
+            return x.nome && x.nome.value.trim() && nomesBatem(x.nome.value, nomeSistema) &&
+                (!codigoSistema || x.codigo.value.trim() === codigoSistema);
+        }, `o ${rotulo} voltar do popup para o formulário`);
+        await esperarAte(() => !acharPopupDependentes(), 'o popup fechar', 5000).catch(() => null);
+        checarParada();
+
+        // 3. Tipo (somente cônjuge / filho(a) ou enteado(a))
+        e = elementosDependente();
+        selecionarTipo(e.tipo, dep.tipo, rotulo);
+        await esperar(TEMPO_ESPERA_CAMPO);
+
+        // 4. Valor e percentual
+        e = elementosDependente();
+        await preencherEConferir(e.valor, dep.valor, `Valor do ${rotulo}`);
+        await preencherEConferir(e.percentual, dep.percentual, `Percentual do ${rotulo}`);
+
+        // Conferência completa antes de salvar
+        e = elementosDependente();
+        if (!nomesBatem(e.nome.value, nomeSistema)) throw new Error(`Conferência falhou: dependente na tela "${e.nome.value}" ≠ "${nomeSistema}"`);
+        conferirTipo(e.tipo, dep.tipo, rotulo);
+        conferirCampo(e.valor, dep.valor, `Valor do ${rotulo}`);
+        conferirCampo(e.percentual, dep.percentual, `Percentual do ${rotulo}`);
+        checarParada();
+
+        if (!autoSalvar) throw new PausaRevisao(`${rotulo} preenchido. Revise, clique em Salvar e depois em ▶ Iniciar.`);
+
+        // 5. Salvar o dependente e conferir no grid
+        lerAlerta();
+        e.salvar.click();
+        let resultado;
+        try {
+            resultado = await esperarAte(() => {
+                let a = espiarAlerta();
+                if (a && REGEX_ALERTA_ERRO.test(a)) return { erro: a };
+                return situacaoNoGrid(lerGridDependentes(), nomeSistema, dep).status === 'igual' ? { ok: true } : null;
+            }, `o ${rotulo} aparecer no grid "Dependentes do Servidor"`, TEMPO_LIMITE_SALVAR);
+        } catch (err) {
+            let s = situacaoNoGrid(lerGridDependentes(), nomeSistema, dep);
+            throw new Error(err.message + (s.linha ? ` (no grid está: ${descreverLinhaGrid(s.linha)})` : ' (não apareceu no grid)'));
+        }
+        let alerta = lerAlerta();
+        if (resultado.erro) throw new Error(`Sistema recusou o ${rotulo}: ${resultado.erro}`);
+        registrarLog('ok', reg.matricula, `Dependente "${nomeSistema}" salvo e conferido no grid (${dep.tipo}, R$ ${dep.valor}, ${dep.percentual}%)` +
+            (alerta ? ` — Sistema: ${alerta}` : ''));
+    }
+
+    // =========================================================================
+    // ROBÔ: PROCESSA UMA MATRÍCULA (idempotente: pode ser repetido após uma pausa)
     // =========================================================================
     let ocupado = false;
 
-    async function processarRegistro(reg, index) {
+    async function processarRegistro(reg) {
         let competencia = localStorage.getItem(K_COMPETENCIA) || '';
-        let campoCodigo = document.getElementById(ID_CODIGO);
         if (!/^\d{2}\/\d{4}$/.test(competencia)) throw new Error('Informe a competência no formato MM/AAAA');
+        let autoSalvar = localStorage.getItem(K_AUTO_SALVAR) === 'sim';
+        protegerAlertasDosFrames();
 
-        // 1. Matrícula
-        mostrarAtual(`Digitando matrícula ${reg.matricula}...`);
-        preencherCampo(campoCodigo, reg.matricula);
-        dispararEnter(campoCodigo);
-        await esperar(TEMPO_ESPERA_MATRICULA);
-        if (ultimoAlerta) {
-            let msg = ultimoAlerta; ultimoAlerta = null;
-            throw new Error('Sistema recusou a matrícula: ' + msg);
-        }
+        // 1. Aba do titular + matrícula + competência
+        mostrarAtual(`Mat. ${reg.matricula}: carregando servidor...`);
+        await irParaAba('Planos de Saúde', 'Plano de Saúde do Servidor');
+        await carregarServidor(reg, competencia);
+        checarParada();
 
-        // 2. Competência
-        let tentativas = 0;
-        while (!selecionarCompetencia(ID_COMPETENCIA, competencia)) {
-            if (++tentativas >= MAX_TENTATIVAS_COMPETENCIA) throw new Error(`Competência ${competencia} não encontrada`);
-            await esperar(TEMPO_LOOP);
-        }
-        await esperar(TEMPO_ESPERA_CAMPO);
+        // 2. Titular
+        let t = elementosTitular();
+        exigirCampos(t, ['valor', 'percentual'], 'Titular');
+        let titularCorreto = parseCentavos(t.valor.value) === parseCentavos(reg.titular.valor) &&
+            parseCentavos(t.percentual.value) === parseCentavos(reg.titular.percentual);
 
-        // 3. Titular
-        let campoValor = document.getElementById(ID_VALOR);
-        let campoPerc = document.getElementById(ID_PERCENTUAL);
-        if (!campoValor || !campoPerc) throw new Error('Campos de valor/percentual do titular não encontrados');
-
-        if (localStorage.getItem(K_PULAR_LANCADOS) !== 'nao' && campoPerc.value.trim() === PERCENTUAL_TITULAR) {
-            registrarLog('info', reg.matricula, 'Já possui 67,73% - pulado');
-            return 'pulado';
-        }
-
-        mostrarAtual(`Mat. ${reg.matricula}: titular R$ ${reg.titular.valor}`);
-        preencherCampo(campoValor, reg.titular.valor);
-        await esperar(TEMPO_ESPERA_CAMPO);
-        preencherCampo(campoPerc, reg.titular.percentual);
-        await esperar(TEMPO_ESPERA_CAMPO);
-
-        // 4. Dependentes
-        for (let i = 0; i < reg.dependentes.length; i++) {
-            if (localStorage.getItem(K_STATUS) !== 'rodando') throw new Error('Interrompido pelo usuário');
-            let d = reg.dependentes[i];
-            mostrarAtual(`Mat. ${reg.matricula}: dependente ${i + 1}/${reg.dependentes.length} (${d.tipo})`);
-            await lancarDependente(d, i + 1, reg.matricula);
-        }
-
-        // 5. Conferência final do titular
-        if (parseCentavos(campoValor.value) !== parseCentavos(reg.titular.valor) ||
-            parseCentavos(campoPerc.value) !== parseCentavos(reg.titular.percentual)) {
-            throw new Error(`Conferência do titular falhou (valor "${campoValor.value}", percentual "${campoPerc.value}")`);
-        }
-
-        // 6. Salvar
-        if (localStorage.getItem(K_AUTO_SALVAR) !== 'sim') {
-            registrarLog('info', reg.matricula, 'Preenchido. Aguardando revisão manual e clique em Salvar.');
-            return 'revisao';
-        }
-        let botaoSalvar = document.getElementById(ID_SALVAR);
-        if (!botaoSalvar) throw new Error('Botão Salvar não encontrado');
-        localStorage.setItem(K_ETAPA, 'salvando:' + index);
-        ultimoAlerta = null;
-        botaoSalvar.click();
-        await esperar(TEMPO_ESPERA_POS_SALVAR);
-        if (ultimoAlerta) {
-            let msg = ultimoAlerta; ultimoAlerta = null;
-            await esperar(TEMPO_ESPERA_POS_POPUP);
-            if (/erro|inv[aá]lid|obrigat|n[aã]o foi|falha/i.test(msg)) throw new Error('Sistema retornou: ' + msg);
-            registrarLog('ok', reg.matricula, 'Salvo. Sistema: ' + msg);
+        if (titularCorreto && localStorage.getItem(K_PULAR_LANCADOS) !== 'nao') {
+            registrarLog('info', reg.matricula, `Titular já correto (R$ ${reg.titular.valor} / ${reg.titular.percentual}%)`);
         } else {
-            registrarLog('ok', reg.matricula, `Salvo (titular ${reg.titular.valor} + ${reg.dependentes.length} dep.)`);
+            mostrarAtual(`Mat. ${reg.matricula}: titular R$ ${reg.titular.valor}`);
+            await preencherEConferir(t.valor, reg.titular.valor, 'Valor do titular');
+            await preencherEConferir(t.percentual, reg.titular.percentual, 'Percentual do titular');
+            conferirCampo(t.valor, reg.titular.valor, 'Valor do titular'); // o percentual pode recalcular a tela
+            checarParada();
+            if (!autoSalvar) throw new PausaRevisao('Titular preenchido. Revise, clique em Salvar e depois em ▶ Iniciar.');
+            await salvarTitular(reg, competencia);
         }
-        return 'salvo';
+
+        if (!reg.dependentes.length) {
+            if (titularCorreto) registrarLog('ok', reg.matricula, 'Sem dependentes e titular já correto — avançando');
+            return;
+        }
+
+        // 3. Dependentes
+        checarParada();
+        mostrarAtual(`Mat. ${reg.matricula}: abrindo aba Dependentes...`);
+        await irParaAba('Dependentes', 'Dependente');
+        let grid = await lerGridDependentesEstavel();
+
+        for (let i = 0; i < reg.dependentes.length; i++) {
+            checarParada();
+            let d = reg.dependentes[i];
+            mostrarAtual(`Mat. ${reg.matricula}: dependente ${i + 1}/${reg.dependentes.length} (${d.nome})`);
+            let situacao = situacaoNoGrid(grid, d.nome, d);
+            if (situacao.status === 'igual') {
+                registrarLog('info', reg.matricula, `Dependente "${situacao.linha.nome}" já lançado corretamente`);
+                continue;
+            }
+            if (situacao.status === 'diferente') {
+                throw new Error(`Dependente já está no grid com dados diferentes — grid: ${descreverLinhaGrid(situacao.linha)} | PDF: ${d.tipo}, R$ ${d.valor}, ${d.percentual}%. Corrija manualmente (botão "A")`);
+            }
+            if (situacao.status === 'ambiguo') {
+                throw new Error(`Dependente "${d.nome}" casa com mais de uma linha do grid: ${situacao.linhas.map(descreverLinhaGrid).join(' / ')}`);
+            }
+            await lancarDependente(d, i + 1, reg, autoSalvar);
+            grid = await lerGridDependentesEstavel();
+        }
+
+        let extras = grid.filter(l => !reg.dependentes.some(d => filtrarPorNome([l], x => x.nome, d.nome).length));
+        if (extras.length) registrarLog('aviso', reg.matricula, `No grid, mas não no PDF (não alterados): ${extras.map(l => l.nome).join(', ')}`);
+
+        await irParaAba('Planos de Saúde', 'Plano de Saúde do Servidor');
+        registrarLog('ok', reg.matricula, `Concluído: titular + ${reg.dependentes.length} dependente(s) conferidos`);
     }
 
     async function cicloRobo() {
@@ -708,14 +1067,6 @@
 
         let dados = JSON.parse(localStorage.getItem(K_DADOS) || '[]');
         let index = parseInt(localStorage.getItem(K_INDEX) || '0', 10);
-
-        // A página recarregou logo após o Salvar: considera salvo e avança
-        let etapa = localStorage.getItem(K_ETAPA) || '';
-        if (etapa === 'salvando:' + index) {
-            registrarLog('ok', dados[index] ? dados[index].matricula : '-', 'Salvo (tela recarregada após salvar)');
-            localStorage.setItem(K_ETAPA, '');
-            localStorage.setItem(K_INDEX, String(++index));
-        }
 
         if (index >= dados.length) {
             localStorage.setItem(K_STATUS, 'parado');
@@ -727,14 +1078,19 @@
         ocupado = true;
         let reg = dados[index];
         try {
-            let resultado = await processarRegistro(reg, index);
-            localStorage.setItem(K_ETAPA, '');
+            if (reg.dependentes.some(d => !d.nascimento)) {
+                throw new Error('Lista gerada por versão antiga do robô. Clique de novo em "⚙ Cruzar e Validar Arquivos".');
+            }
+            await processarRegistro(reg);
             localStorage.setItem(K_INDEX, String(index + 1));
-            if (resultado === 'revisao') localStorage.setItem(K_STATUS, 'parado');
         } catch (e) {
-            localStorage.setItem(K_ETAPA, '');
             localStorage.setItem(K_STATUS, 'parado');
-            registrarLog('erro', reg.matricula, e.message + ' — robô PAUSADO. Corrija e use ▶ Iniciar (repete) ou Avançar ⏩ (pula).');
+            if (e instanceof PausaRevisao) {
+                registrarLog('aviso', reg.matricula, e.message);
+            } else {
+                console.error(e);
+                registrarLog('erro', reg.matricula, e.message + ' — robô PAUSADO. Corrija e use ▶ Iniciar (repete) ou Avançar ⏩ (pula).');
+            }
         } finally {
             ocupado = false;
             atualizarPainel();
@@ -782,14 +1138,15 @@
 
     // Lista todos os campos da tela (e iframes internos) para descobrir os IDs reais
     function diagnosticoCampos() {
-        let linhas = ['DOC;TAG;TYPE;ID;NAME;VISIVEL;VALOR;TEXTO/OPCOES'];
+        let linhas = ['DOC;URL;TAG;TYPE;ID;NAME;VISIVEL;VALOR;TEXTO/OPCOES'];
         documentosAcessiveis().forEach((d, n) => {
-            d.querySelectorAll('input, select, textarea, button, a[onclick]').forEach(el => {
+            let url = (d.location ? d.location.pathname : '').split('/').pop();
+            d.querySelectorAll('input, select, textarea, button, a, legend').forEach(el => {
                 if (el.closest('#painel-ecps')) return;
                 let texto = el.tagName === 'SELECT'
                     ? Array.from(el.options).map(o => o.text.trim()).join(' | ')
-                    : (el.textContent || el.title || '').trim().slice(0, 60);
-                linhas.push([n, el.tagName, el.type || '', el.id, el.name || '', visivel(el) ? 'S' : 'N', (el.value || '').slice(0, 40), texto].join(';'));
+                    : (el.textContent || el.title || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+                linhas.push([n, url, el.tagName, el.type || '', el.id, el.name || '', visivel(el) ? 'S' : 'N', (el.value || '').slice(0, 40), texto].join(';'));
             });
         });
         let saida = linhas.join('\r\n');
@@ -832,7 +1189,7 @@
                 <button id="ecps-btn-processar" style="${estiloBtn} width:100%; background:#0056b3; padding:8px; font-weight:bold; margin-bottom:10px;">⚙ 3. Cruzar e Validar Arquivos</button>
 
                 <label style="display:block; font-size: 12px; margin-bottom: 3px;"><input type="checkbox" id="ecps-auto-salvar"> Clicar em <strong>Salvar</strong> automaticamente</label>
-                <label style="display:block; font-size: 12px; margin-bottom: 10px;"><input type="checkbox" id="ecps-pular"> Pular quem já tem 67,73%</label>
+                <label style="display:block; font-size: 12px; margin-bottom: 10px;"><input type="checkbox" id="ecps-pular"> Pular titular já correto (67,73% <u>e</u> valor)</label>
 
                 <div style="background: #f8f9fa; padding: 10px; border-radius: 4px; margin-bottom: 10px; border: 1px solid #ddd;">
                     <p style="margin: 0 0 5px 0;">Status: <strong id="ecps-status-texto" style="color:#dc3545;">Parado</strong></p>
