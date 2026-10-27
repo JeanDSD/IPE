@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Plano de Saúde - Cruzamento CSV x PDF IPE e Lançamento Automático
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Cruza o CSV da rubrica (R963) com o PDF de contribuições do IPE Saúde, valida titular + dependentes e lança no Plano de Saúde do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -75,6 +75,7 @@
     const K_RESUMO = 'ecps_resumo';
     const K_ALERTA = 'ecps_alerta';
     const K_SEM_COMPETENCIA = 'ecps_sem_competencia';
+    const K_PENDENCIAS = 'ecps_pendencias';
 
     // =========================================================================
     // <<NUCLEO>> PROCESSAMENTO DOS ARQUIVOS (funções puras, sem DOM)
@@ -225,16 +226,11 @@
         return tipo === TIPO_CONJUGE ? PERCENTUAL_CONJUGE : PERCENTUAL_FILHO;
     }
 
-    // Menos de 18 anos: filho. De 18 a 24: decide pelo valor (menor que o do titular = filho,
-    // igual ao do titular = cônjuge). 25 ou mais: cônjuge.
-    // Retorna null quando não dá para decidir (18 a 24 anos com valor maior que o do titular).
+    // Menos de 18 anos: filho. De 18 a 24: decide pelo valor (menor que o do titular = filho;
+    // igual ou maior = cônjuge, pois o valor do cônjuge depende da idade dele). 25 ou mais: cônjuge.
     function tipoDependente(idade, valorDependente, valorTitular) {
         if (idade < IDADE_MAIORIDADE) return TIPO_FILHO;
-        if (idade <= IDADE_LIMITE_FILHO) {
-            if (valorDependente < valorTitular) return TIPO_FILHO;
-            if (valorDependente === valorTitular) return TIPO_CONJUGE;
-            return null;
-        }
+        if (idade <= IDADE_LIMITE_FILHO) return valorDependente < valorTitular ? TIPO_FILHO : TIPO_CONJUGE;
         return TIPO_CONJUGE;
     }
 
@@ -297,13 +293,6 @@
                 return;
             }
             let tipos = t.dependentes.map(d => tipoDependente(d.idade, d.contribuicao, t.contribuicao));
-            let indefinido = t.dependentes.find((d, k) => !tipos[k]);
-            if (indefinido) {
-                erros.push(Object.assign(base, {
-                    motivo: `Dependente "${indefinido.nome}" (${indefinido.idade} anos) com valor ${formatCentavos(indefinido.contribuicao)} maior que o do titular (${formatCentavos(t.contribuicao)}): não dá para saber se é filho ou cônjuge`
-                }));
-                return;
-            }
             lista.push({
                 matricula: s.matricula,
                 nome: s.nome,
@@ -441,6 +430,7 @@
             localStorage.setItem(K_STATUS, 'parado');
             localStorage.setItem(K_LOG, '[]');
             localStorage.setItem(K_SEM_COMPETENCIA, '[]');
+            localStorage.setItem(K_PENDENCIAS, '[]');
 
             registrarLog('info', '-', `CSV: ${servidores.length} matrículas | PDF: ${titulares.length} titulares, ${registros.length - titulares.length} dependentes`);
             registrarLog('info', '-', `Validados: ${lista.length} | Com erro no cruzamento: ${erros.length}`);
@@ -471,6 +461,10 @@
 
     // Servidor sem a competência na lista do e-cidade: é pulado e anotado (não pausa o robô)
     class SemCompetencia extends Error {}
+
+    // Problema com um dependente no popup (não carregou, não achou, ambíguo): anota em "Pendências",
+    // fecha o popup e segue para o próximo servidor (não pausa o robô)
+    class Pendencia extends Error {}
 
     function checarParada() {
         if (localStorage.getItem(K_STATUS) !== 'rodando') throw new Error('Interrompido pelo usuário (⏸ Parar)');
@@ -565,13 +559,14 @@
         }
     }
 
-    // Um nome é o outro sem os nomes do meio: "JOVANA ORTIZ" x "JOVANA MACHADO ORTIZ"
-    // (mesmo primeiro e último nome, e os termos do nome curto aparecem na mesma ordem no longo)
+    // Um nome é o outro com nomes a menos (no meio ou no fim):
+    // "JOVANA ORTIZ" x "JOVANA MACHADO ORTIZ", "ROSANGELA MACHADO" x "ROSANGELA MACHADO SOUZA".
+    // Mesmo primeiro nome e todos os termos do nome curto aparecem, na mesma ordem, no longo.
     function nomeContido(curto, longo) {
         let a = normalizarNome(curto).split(' ').filter(t => !PARTICULAS.includes(t));
         let b = normalizarNome(longo).split(' ').filter(t => !PARTICULAS.includes(t));
         if (a.length < 2 || a.length >= b.length) return false;
-        if (a[0] !== b[0] || a[a.length - 1] !== b[b.length - 1]) return false;
+        if (a[0] !== b[0]) return false;
         let j = 0;
         for (let t of a) {
             while (j < b.length && !termosParecidos(t, b[j])) j++;
@@ -881,9 +876,10 @@
         let reserva = null;
         for (let d of documentosAcessiveis()) {
             if (!d.body) continue;
-            let linhas = lerTabela(d.body, ['nome do dependente']);
-            if (linhas === null) continue;
             let texto = textoNorm(d.body.textContent);
+            if (!texto.includes('nome do dependente')) continue;
+            let linhas = lerTabela(d.body, ['nome do dependente']);
+            if (!linhas || !linhas.length) linhas = lerLinhasPopupSemCabecalho(d);
             let qtd = texto.match(/retornados (\d+) registro/);
             if (!linhas.length && !(qtd && qtd[1] === '0') && !/nenhum registro/.test(texto)) continue;
             let popup = { doc: d, linhas };
@@ -891,6 +887,28 @@
             if (!reserva && matricula && linhas.some(l => l['matricula do servidor'] === matricula)) reserva = popup;
         }
         return reserva;
+    }
+
+    // Leitor alternativo do popup, que não depende do cabeçalho: uma linha de dependente tem
+    // código (número), nome (letras) e data de nascimento (dd/mm/aaaa)
+    function lerLinhasPopupSemCabecalho(doc) {
+        let linhas = [];
+        for (let tr of Array.from(doc.querySelectorAll('tr'))) {
+            if (tr.querySelector('table, input, select')) continue;
+            let celulas = Array.from(tr.cells);
+            let textos = celulas.map(c => (c.textContent || '').replace(/\s+/g, ' ').trim());
+            let iData = textos.findIndex(t => /^\d{2}\/\d{2}\/\d{4}$/.test(t));
+            let iNome = textos.findIndex(t => /^[A-Za-zÀ-ÿ'´`^~.\s]{3,}$/.test(t) && t.trim().indexOf(' ') > 0);
+            let numeros = textos.map((t, i) => /^\d+$/.test(t) ? i : -1).filter(i => i >= 0);
+            if (iData < 0 || iNome < 0 || !numeros.length) continue;
+            let obj = { _tr: tr, _cel: { 'nome do dependente': celulas[iNome] } };
+            obj['codigo'] = textos[numeros[0]];
+            if (numeros.length > 1) obj['matricula do servidor'] = textos[numeros[1]];
+            obj['nome do dependente'] = textos[iNome];
+            obj['data de nascimento'] = textos[iData];
+            linhas.push(obj);
+        }
+        return linhas;
     }
 
     // Resumo dos frames para o log quando o popup não é reconhecido
@@ -936,24 +954,29 @@
             if (candidatos.length === 1) return candidatos[0];
             if (candidatos.length > 1) {
                 fecharPopup(popup);
-                throw new Error(`${rotulo}: ${candidatos.length} registros possíveis no popup (${candidatos.map(l => l['codigo'] + ' ' + l['nome do dependente']).join(', ')})`);
+                throw new Pendencia(`${rotulo}: ${candidatos.length} registros possíveis no popup (${candidatos.map(l => l['codigo'] + ' ' + l['nome do dependente']).join(', ')})`);
             }
             if (porNome.length) {
                 fecharPopup(popup);
-                throw new Error(`${rotulo}: nome achado no popup, mas a data de nascimento não confere (PDF ${dep.nascimento} x sistema ${porNome.map(l => l['data de nascimento']).join(', ')})`);
+                throw new Pendencia(`${rotulo}: nome achado no popup, mas a data de nascimento não confere (PDF ${dep.nascimento} x sistema ${porNome.map(l => l['data de nascimento']).join(', ')})`);
             }
             let proximo = botaoNoDoc(popup.doc, 'Próximo');
             if (!proximo || proximo.disabled) break;
             let assinatura = popup.linhas.map(l => l._tr.textContent).join('|');
             proximo.click();
-            popup = await esperarAte(() => {
-                let p = acharPopupDependentes(reg.matricula);
-                return p && p.linhas.map(l => l._tr.textContent).join('|') !== assinatura ? p : null;
-            }, 'a próxima página do popup');
+            try {
+                popup = await esperarAte(() => {
+                    let p = acharPopupDependentes(reg.matricula);
+                    return p && p.linhas.map(l => l._tr.textContent).join('|') !== assinatura ? p : null;
+                }, 'a próxima página do popup');
+            } catch (err) {
+                fecharPopupsVisiveis();
+                throw new Pendencia(`${rotulo}: ${err.message}`);
+            }
         }
         let listados = popup.linhas.map(l => l['nome do dependente']).join(', ');
         fecharPopup(popup);
-        throw new Error(`${rotulo} não encontrado no popup "Pesquisar Dependentes" (listados: ${listados || 'nenhum'})`);
+        throw new Pendencia(`${rotulo} não encontrado no popup "Pesquisar Dependentes" (listados: ${listados || 'nenhum'})`);
     }
 
     function clicarLinhaPopup(linha) {
@@ -1057,7 +1080,7 @@
             let frames = resumoFrames();
             console.log('[Robô Plano de Saúde] popup não reconhecido. Frames:', frames);
             fecharPopupsVisiveis();
-            throw new Error(`${err.message}. Frames: ${frames} — clique em 🔎 Diagnóstico com o popup aberto e envie o arquivo`);
+            throw new Pendencia(`${rotulo}: popup "Pesquisar Dependentes" não foi lido. Frames: ${frames}`);
         }
         protegerAlertasDosFrames();
         let linha = await escolherNoPopup(popup, dep, reg, rotulo);
@@ -1190,6 +1213,16 @@
             if (situacao.status === 'ambiguo') {
                 throw new Error(`Dependente "${d.nome}" casa com mais de uma linha do grid: ${situacao.linhas.map(descreverLinhaGrid).join(' / ')}`);
             }
+            // Nome diferente no sistema, mas uma única linha do grid com o mesmo primeiro nome e
+            // exatamente o mesmo tipo/valor/percentual: já está lançado (não abre o popup)
+            let primeiro = normalizarNome(d.nome).split(' ')[0];
+            let mesmaPessoa = grid.filter(l => !conferidos.includes(l.nome) &&
+                normalizarNome(l.nome).split(' ')[0] === primeiro && situacaoNoGrid([l], l.nome, d).status === 'igual');
+            if (mesmaPessoa.length === 1) {
+                registrarLog('info', reg.matricula, `Dependente "${mesmaPessoa[0].nome}" (PDF: ${d.nome}) já lançado corretamente — casado pelo primeiro nome e valores`);
+                conferidos.push(mesmaPessoa[0].nome);
+                continue;
+            }
             conferidos.push(await lancarDependente(d, i + 1, reg, autoSalvar));
             grid = await lerGridDependentesEstavel();
         }
@@ -1207,6 +1240,12 @@
             .filter(x => !(x.matricula === reg.matricula && x.competencia === competencia));
         lista.push({ matricula: reg.matricula, nome: reg.nome, competencia });
         localStorage.setItem(K_SEM_COMPETENCIA, JSON.stringify(lista));
+    }
+
+    function registrarPendencia(reg, motivo) {
+        let lista = JSON.parse(localStorage.getItem(K_PENDENCIAS) || '[]').filter(x => x.matricula !== reg.matricula);
+        lista.push({ matricula: reg.matricula, nome: reg.nome, motivo });
+        localStorage.setItem(K_PENDENCIAS, JSON.stringify(lista));
     }
 
     async function cicloRobo() {
@@ -1238,6 +1277,13 @@
             if (e instanceof SemCompetencia) {
                 registrarSemCompetencia(reg);
                 registrarLog('aviso', reg.matricula, `${reg.nome}: ${e.message} — pulado e anotado na lista "Sem competência"`);
+                localStorage.setItem(K_INDEX, String(index + 1));
+                return;
+            }
+            if (e instanceof Pendencia) {
+                fecharPopupsVisiveis();
+                registrarPendencia(reg, e.message);
+                registrarLog('erro', reg.matricula, `${e.message} — anotado em "Pendências"; seguindo para o próximo`);
                 localStorage.setItem(K_INDEX, String(index + 1));
                 return;
             }
@@ -1309,6 +1355,12 @@
         let saida = linhas.join('\r\n');
         console.log(saida);
         baixarArquivo('diagnostico_campos_plano_saude.csv', saida);
+        // HTML do popup de dependentes (se estiver aberto), para ajustar o leitor da tabela
+        documentosAcessiveis().forEach((d, n) => {
+            if (d.body && textoNorm(d.body.textContent).includes('nome do dependente')) {
+                setTimeout(() => baixarArquivo(`diagnostico_popup_${n}.html`, d.documentElement.outerHTML), 500 * (n + 1));
+            }
+        });
     }
 
     // =========================================================================
@@ -1352,7 +1404,7 @@
                     <p style="margin: 0 0 5px 0;">Status: <strong id="ecps-status-texto" style="color:#dc3545;">Parado</strong></p>
                     <p style="margin: 0 0 5px 0; font-size: 12px;" id="ecps-resumo"></p>
                     <p style="margin: 0 0 5px 0;">Progresso: <strong id="ecps-linha">0 / 0</strong> &nbsp;|&nbsp; Erros: <strong id="ecps-qtd-erros" style="color:#dc3545;">0</strong></p>
-                    <p style="margin: 0 0 5px 0; font-size: 12px;">Sem competência (pulados): <strong id="ecps-qtd-sem-comp" style="color:#c77c00;">0</strong></p>
+                    <p style="margin: 0 0 5px 0; font-size: 12px;">Sem competência (pulados): <strong id="ecps-qtd-sem-comp" style="color:#c77c00;">0</strong> &nbsp;|&nbsp; Pendências: <strong id="ecps-qtd-pend" style="color:#c77c00;">0</strong></p>
                     <p style="margin: 0; font-size: 12px; color: #555; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" id="ecps-dados-atuais">Nenhum dado</p>
                     <p style="margin: 3px 0 0 0; font-size: 11px; color: #555; white-space: normal;" id="ecps-detalhe"></p>
                 </div>
@@ -1373,7 +1425,8 @@
                     <button id="ecps-btn-csv" style="${estiloBtn} background: #343a40;">⬇ CSV gerado</button>
                     <button id="ecps-btn-erros" style="${estiloBtn} background: #343a40;">⬇ Erros</button>
                     <button id="ecps-btn-diag" style="${estiloBtn} background: #343a40;">🔎 Diagnóstico</button>
-                    <button id="ecps-btn-sem-comp" style="${estiloBtn} background: #c77c00; flex-basis: 100%;">⬇ Sem competência</button>
+                    <button id="ecps-btn-sem-comp" style="${estiloBtn} background: #c77c00;">⬇ Sem competência</button>
+                    <button id="ecps-btn-pend" style="${estiloBtn} background: #c77c00;">⬇ Pendências</button>
                 </div>
             </div>
         `;
@@ -1427,6 +1480,11 @@
             let linhas = ['MATRICULA;NOME;COMPETENCIA'].concat(lista.map(x => [x.matricula, x.nome, x.competencia].join(';')));
             baixarArquivo('plano_saude_sem_competencia.csv', linhas.join('\r\n'));
         });
+        document.getElementById('ecps-btn-pend').addEventListener('click', () => {
+            let lista = JSON.parse(localStorage.getItem(K_PENDENCIAS) || '[]');
+            let linhas = ['MATRICULA;NOME;MOTIVO'].concat(lista.map(x => [x.matricula, x.nome, x.motivo.replace(/;/g, ',')].join(';')));
+            baixarArquivo('plano_saude_pendencias.csv', linhas.join('\r\n'));
+        });
 
         renderizarLog();
         atualizarPainel();
@@ -1455,6 +1513,7 @@
         if (!statusElement) return;
         document.getElementById('ecps-resumo').textContent = localStorage.getItem(K_RESUMO) || 'Arquivos ainda não processados';
         document.getElementById('ecps-qtd-sem-comp').textContent = JSON.parse(localStorage.getItem(K_SEM_COMPETENCIA) || '[]').length;
+        document.getElementById('ecps-qtd-pend').textContent = JSON.parse(localStorage.getItem(K_PENDENCIAS) || '[]').length;
 
         let status = localStorage.getItem(K_STATUS) || 'parado';
         let dados = JSON.parse(localStorage.getItem(K_DADOS) || '[]');
