@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação 353) e lança em Assentamentos Normais > Inclusão do e-cidade.
+// @version      1.4
+// @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação REVOG) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
 // @grant        none
@@ -46,7 +46,7 @@
     // <<NUCLEO>> LEITURA DA PORTARIA E REGRAS DE NEGÓCIO (funções puras, sem DOM)
     // =========================================================================
     const CODIGO_LICENCA = '35';     // LICENCA PREMIO (gozo)
-    const CODIGO_REVOGACAO = '353';  // revogação de portaria
+    const CODIGO_REVOGACAO = 'REVOG'; // REVOGACAO (revogação de portaria)
     const TIPO_ATO = 'PORTARIA';
     const PARTICULAS = ['DE', 'DA', 'DO', 'DOS', 'DAS', 'E', 'D'];
     const MESES = {
@@ -471,7 +471,7 @@
 
         registrarLog('info', '-', `Portaria nº ${r.numeroAto || '?'} de ${r.dataPortaria || '?'} — protocolos: ${r.protocolos.join(', ') || 'nenhum'}`);
         let qtd = tipo => r.itens.filter(it => it.tipo === tipo).length;
-        registrarLog('info', '-', `Lançamentos: ${qtd('licenca')} licença(s)-prêmio (35), ${qtd('revogacao')} revogação(ões) (353), ${qtd('pulado')} pulado(s)`);
+        registrarLog('info', '-', `Lançamentos: ${qtd('licenca')} licença(s)-prêmio (35), ${qtd('revogacao')} revogação(ões) (REVOG), ${qtd('pulado')} pulado(s)`);
         r.avisos.forEach(a => { registrarLog('aviso', '-', a); registrarAviso('-', '', a); });
         r.itens.forEach((it, i) => {
             if (it.tipo === 'pulado') return;
@@ -1432,7 +1432,7 @@
                 let el;
                 if (chave === 'tipo') {
                     el = document.createElement('select');
-                    [['licenca', 'Licença (35)'], ['revogacao', 'Revogação (353)'], ['pulado', 'Pulado']].forEach(([v, t]) => el.add(new Option(t, v)));
+                    [['licenca', 'Licença (35)'], ['revogacao', 'Revogação (REVOG)'], ['pulado', 'Pulado']].forEach(([v, t]) => el.add(new Option(t, v)));
                 } else if (chave === 'historico') {
                     el = document.createElement('textarea');
                     el.rows = 4;

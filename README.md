@@ -32,7 +32,7 @@ assentamentos em **Recursos Humanos > Assentamentos Normais > Inclusão**.
 4. Clique em **▶ Iniciar**.
 
 Regras: gozo de licença-prêmio → código **35**, com o histórico no modelo padrão e o
-protocolo na mesma ordem dos servidores; revogação de portaria → código **353**, com a data
+protocolo na mesma ordem dos servidores; revogação de portaria → código **REVOG** (REVOGACAO), com a data
 da portaria nos dois campos e o texto do artigo como está na folha; outros temas (venda de
 licença, IPTU...) são pulados e vão para **⬇ Avisos**. O servidor é pesquisado pelo nome; com
 mais de um cadastro, fica o sem data de rescisão e, se ainda houver mais de um, o que condiz
