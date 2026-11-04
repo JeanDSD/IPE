@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação REVOG) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -660,7 +660,10 @@
         if (doc === document) return true;
         try {
             let frame = doc.defaultView && doc.defaultView.frameElement;
-            return !frame || visivel(frame);
+            if (!frame) return true;
+            if (!visivel(frame)) return false;
+            let estilo = frame.ownerDocument.defaultView.getComputedStyle(frame);
+            return estilo.visibility !== 'hidden' && estilo.display !== 'none';
         } catch (e) {
             return false;
         }
@@ -938,8 +941,8 @@
         return termos.filter((t, i) => t && termos.indexOf(t) === i);
     }
 
-    async function pesquisarNoPopup(termo, it) {
-        let pop = acharPopupPesquisa();
+    async function pesquisarNoPopup(termo, it, primeira) {
+        let pop = primeira ? null : acharPopupPesquisa();
         if (!pop) {
             let f = elementosForm();
             exigirCampos(f, ['linkServidor', 'codigo', 'nome'], 'Servidor');
@@ -957,7 +960,8 @@
         preencherCampo(campo, termo);
         pesquisar.click();
         const condicao = aceitarAntigo => {
-            if (servidorNaTela(null, it.nome) && !acharPopupPesquisa()) return { auto: true };
+            // um único cadastro: o e-cidade já devolve o servidor para o formulário (o campo foi limpo antes)
+            if (servidorNaTela(null, it.nome)) return { auto: true };
             let d = acharPopupPesquisa();
             if (!d) return null;
             // nome pesquisado: no campo visível ou no oculto da paginação (chave_z01_nome);
@@ -1010,10 +1014,12 @@
 
         let rotulo = `"${it.nome}"`;
         let tentados = [];
+        let primeira = true;
         for (let termo of termosDeBusca(it.nome)) {
             checarParada();
             mostrarAtual(`${it.nome}: pesquisando "${termo}"...`);
-            let r = await pesquisarNoPopup(termo, it);
+            let r = await pesquisarNoPopup(termo, it, primeira);
+            primeira = false;
             if (r.auto) {
                 let f = elementosForm();
                 registrarLog('info', f.codigo.value, `${rotulo}: pesquisa trouxe um único cadastro (${f.codigo.value} - ${f.nome.value})`);
