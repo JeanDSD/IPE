@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação 353) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -761,6 +761,10 @@
                 let el = escopo.ownerDocument.getElementById(r.htmlFor);
                 if (el) candidatos = [el];
             }
+            // Layout em <div><label>Rótulo:</label><input></div> (ex: Pesquisa de Servidores)
+            if (!candidatos.length && celula.parentElement) {
+                candidatos = Array.from(celula.parentElement.querySelectorAll('input, select, textarea'));
+            }
             let depois = candidatos.filter(c => (celula.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING) &&
                 !['hidden', 'button', 'submit'].includes(c.type));
             if (depois.length) return depois;
@@ -860,6 +864,10 @@
             fieldsetPorLegenda('Pesquisa de Servidores', d)) || null;
     }
 
+    function campoNomePesquisa(doc) {
+        return doc.getElementById('chave_z01_nome') || camposAposRotulo(doc.body, 'Nome/Razão Social')[0] || null;
+    }
+
     function lerResultados(doc) {
         let linhas = lerTabela(doc.body, ['matricula', 'nome/razao social']);
         if (!linhas) return null;
@@ -912,8 +920,8 @@
             pop = await esperarAte(() => acharPopupPesquisa(), 'abrir a "Pesquisa de Servidores"');
             protegerAlertasDosFrames();
         }
-        let campo = camposAposRotulo(pop.body, 'Nome/Razão Social')[0];
-        let pesquisar = botaoNoDoc(pop, 'Pesquisar');
+        let campo = campoNomePesquisa(pop);
+        let pesquisar = pop.getElementById('pesquisar2') || botaoNoDoc(pop, 'Pesquisar');
         if (!campo || !pesquisar) throw new Error('Pesquisa de Servidores: não achei o campo Nome/Razão Social ou o botão Pesquisar (envie o 🔎 Diagnóstico)');
         let antes = assinaturaResultados(pop);
         pop.__ecasVelho = true;
@@ -923,8 +931,9 @@
             if (servidorNaTela(null, it.nome) && !acharPopupPesquisa()) return { auto: true };
             let d = acharPopupPesquisa();
             if (!d) return null;
-            let c = camposAposRotulo(d.body, 'Nome/Razão Social')[0];
-            if (!c || normalizarNome(c.value) !== normalizarNome(termo)) return null;
+            let c = campoNomePesquisa(d);
+            // o campo tem maxlength 40: o e-cidade pode devolver o nome cortado
+            if (!c || normalizarNome(c.value).slice(0, 40) !== normalizarNome(termo).slice(0, 40)) return null;
             if (!aceitarAntigo && d.__ecasVelho && assinaturaResultados(d) === antes) return null;
             let linhas = lerResultados(d);
             if (linhas && linhas.length) return { doc: d, linhas };
