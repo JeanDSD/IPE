@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.8
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação REVOG) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -954,23 +954,29 @@
             exigirCampos(f, ['linkServidor', 'codigo', 'nome'], 'Servidor');
             f.codigo.value = '';
             f.nome.value = '';
+            // O e-cidade mostra na hora a janela da pesquisa anterior e só depois carrega a nova:
+            // marca as páginas que já existem e espera uma página nova da pesquisa
+            documentosAcessiveis().forEach(d => { d.__ecasAntesDoLink = true; });
             f.linkServidor.click();
-            pop = await esperarAte(() => acharPopupPesquisa(), 'abrir a "Pesquisa de Servidores"');
+            pop = await esperarAte(() => {
+                let d = acharPopupPesquisa();
+                return d && !d.__ecasAntesDoLink && d.readyState === 'complete' && campoNomePesquisa(d) ? d : null;
+            }, 'abrir a "Pesquisa de Servidores"', 8000).catch(e => { relancarErroSistema(e); return null; });
+            // se o e-cidade reaproveitou a mesma página (sem recarregar), usa a que está aberta
+            if (!pop) pop = await esperarAte(() => acharPopupPesquisa(), 'abrir a "Pesquisa de Servidores"');
+            await esperar(TEMPO_ESPERA_CAMPO);
             protegerAlertasDosFrames();
         }
-        let campo = campoNomePesquisa(pop);
-        let pesquisar = pop.getElementById('pesquisar2') || botaoNoDoc(pop, 'Pesquisar');
-        if (!campo || !pesquisar) throw new Error('Pesquisa de Servidores: não achei o campo Nome/Razão Social ou o botão Pesquisar (envie o 🔎 Diagnóstico)');
-        let antes = assinaturaResultados(pop);
-        pop.__ecasVelho = true;
-        preencherCampo(campo, termo);
-        pesquisar.click();
-        const condicao = aceitarAntigo => {
-            // um único cadastro: o e-cidade já devolve o servidor para o formulário (o campo foi limpo antes)
-            if (servidorNaTela(null, it.nome)) return { auto: true };
+        const condicao = (aceitarAntigo, antes) => {
+            let f = elementosForm();
+            if (f.codigo && f.codigo.value.trim()) {
+                // um único cadastro: o e-cidade devolve a matrícula para o formulário e carrega o nome logo depois
+                if (!f.nome || !f.nome.value.trim()) return null;
+                if (nomesBatem(f.nome.value, it.nome)) return { auto: true };
+            }
             let d = acharPopupPesquisa();
             if (!d) return null;
-            let novo = !d.__ecasVelho; // página recarregada pela pesquisa
+            let novo = !d.__ecasVelho; // página recarregada depois do clique em Pesquisar
             if (!novo && !aceitarAntigo) {
                 if (assinaturaResultados(d) === antes) return null;
                 // nome pesquisado: no campo visível ou no oculto da paginação (chave_z01_nome, até 40 letras)
@@ -981,21 +987,40 @@
             let linhas = lerResultados(d);
             if (linhas && linhas.length) return { doc: d, linhas };
             if (/nenhum registro|retornados 0 registro|nao foram encontrad|nao ha registro/.test(textoNorm(d.body.textContent))) return { doc: d, linhas: [] };
-            // sem resultado o e-cidade mostra só o formulário de pesquisa, sem mensagem
-            if (novo || aceitarAntigo) {
+            if ((novo || aceitarAntigo) && d.readyState === 'complete') {
                 if (!d.__ecasVisto) d.__ecasVisto = Date.now();
-                if (d.readyState === 'complete' && Date.now() - d.__ecasVisto > 1500) return { doc: d, linhas: [] };
+                let espera = Date.now() - d.__ecasVisto;
+                let c = campoNomePesquisa(d);
+                // página nova com o campo Nome vazio: não é a resposta da pesquisa (o e-cidade recarregou a janela)
+                if (espera > 800 && c && !normalizarNome(c.value)) return { refazer: d };
+                // sem resultado o e-cidade mostra só o formulário (com o nome pesquisado), sem mensagem
+                if (espera > 3000) return { doc: d, linhas: [] };
             }
             return null;
         };
-        try {
-            return await esperarAte(() => condicao(false), `o resultado da pesquisa "${termo}"`);
-        } catch (e) {
-            relancarErroSistema(e);
-            let r = condicao(true);
-            if (r) return r;
-            throw e;
+
+        for (let envio = 1; envio <= 3; envio++) {
+            let campo = campoNomePesquisa(pop);
+            let pesquisar = pop.getElementById('pesquisar2') || botaoNoDoc(pop, 'Pesquisar');
+            if (!campo || !pesquisar) throw new Error('Pesquisa de Servidores: não achei o campo Nome/Razão Social ou o botão Pesquisar (envie o 🔎 Diagnóstico)');
+            let antes = assinaturaResultados(pop);
+            pop.__ecasVelho = true;
+            preencherCampo(campo, termo);
+            await esperar(TEMPO_ESPERA_CAMPO);
+            pesquisar.click();
+            let r;
+            try {
+                r = await esperarAte(() => condicao(false, antes), `o resultado da pesquisa "${termo}"`);
+            } catch (e) {
+                relancarErroSistema(e);
+                r = condicao(true, antes);
+                if (!r) throw e;
+            }
+            if (!r.refazer) return r;
+            pop = r.refazer;
+            console.log(`[Robô Assentamentos] a pesquisa "${termo}" voltou vazia (janela recarregada); pesquisando de novo (${envio}/3)`);
         }
+        throw new Error(`A Pesquisa de Servidores não respondeu à pesquisa "${termo}" (3 tentativas)`);
     }
 
     function clicarResultado(linha) {
