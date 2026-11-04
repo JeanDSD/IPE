@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação REVOG) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -934,10 +934,16 @@
     }
 
     // Variações de busca: nome inteiro; sem acento; primeiro + último; primeiro + segundo
+    // A pesquisa do e-cidade é "começa com" (z01_nome like 'TERMO%') e o campo aceita 40 letras:
+    // tenta o nome inteiro e depois vai tirando nomes do fim (até sobrar nome + 1 sobrenome)
     function termosDeBusca(nome) {
+        const corta = t => t.slice(0, 40).trim();
         let partes = normalizarNome(nome).split(' ').filter(Boolean);
-        let termos = [nome.trim(), normalizarNome(nome)];
-        if (partes.length > 2) termos.push(partes[0] + ' ' + partes[partes.length - 1], partes[0] + ' ' + partes[1]);
+        let termos = [corta(nome.trim().toUpperCase()), corta(normalizarNome(nome))];
+        for (let n = partes.length - 1; n >= 2; n--) {
+            if (PARTICULAS.includes(partes[n - 1])) continue;
+            termos.push(corta(partes.slice(0, n).join(' ')));
+        }
         return termos.filter((t, i) => t && termos.indexOf(t) === i);
     }
 
@@ -964,15 +970,22 @@
             if (servidorNaTela(null, it.nome)) return { auto: true };
             let d = acharPopupPesquisa();
             if (!d) return null;
-            // nome pesquisado: no campo visível ou no oculto da paginação (chave_z01_nome);
-            // o campo tem maxlength 40, então o e-cidade pode devolver o nome cortado
-            let pesquisados = [campoNomePesquisa(d)].concat(Array.from(d.getElementsByName('chave_z01_nome')))
-                .filter(Boolean).map(c => normalizarNome(c.value).slice(0, 40));
-            if (!pesquisados.includes(normalizarNome(termo).slice(0, 40))) return null;
-            if (!aceitarAntigo && d.__ecasVelho && assinaturaResultados(d) === antes) return null;
+            let novo = !d.__ecasVelho; // página recarregada pela pesquisa
+            if (!novo && !aceitarAntigo) {
+                if (assinaturaResultados(d) === antes) return null;
+                // nome pesquisado: no campo visível ou no oculto da paginação (chave_z01_nome, até 40 letras)
+                let pesquisados = [campoNomePesquisa(d)].concat(Array.from(d.getElementsByName('chave_z01_nome')))
+                    .filter(Boolean).map(c => normalizarNome(c.value).slice(0, 40));
+                if (!pesquisados.includes(normalizarNome(termo).slice(0, 40))) return null;
+            }
             let linhas = lerResultados(d);
             if (linhas && linhas.length) return { doc: d, linhas };
             if (/nenhum registro|retornados 0 registro|nao foram encontrad|nao ha registro/.test(textoNorm(d.body.textContent))) return { doc: d, linhas: [] };
+            // sem resultado o e-cidade mostra só o formulário de pesquisa, sem mensagem
+            if (novo || aceitarAntigo) {
+                if (!d.__ecasVisto) d.__ecasVisto = Date.now();
+                if (d.readyState === 'complete' && Date.now() - d.__ecasVisto > 1500) return { doc: d, linhas: [] };
+            }
             return null;
         };
         try {
@@ -1013,6 +1026,7 @@
         if (conhecida) return carregarPorMatricula(conhecida, it);
 
         let rotulo = `"${it.nome}"`;
+        await esperarFormularioLivre();
         let tentados = [];
         let primeira = true;
         for (let termo of termosDeBusca(it.nome)) {
@@ -1246,6 +1260,7 @@
         let confirmacao = await incluir(it);
         salvarItem(indice, { situacao: 'lançado' });
         registrarLog('ok', matricula, `${rotulo}: incluído ${it.codigo} - ${descricao} (${it.dataIni} a ${it.dataFim}, ${it.dias} dia(s)) — ${confirmacao}`);
+        await esperarFormularioLivre(); // o e-cidade ainda recarrega o servidor depois do Incluir
     }
 
     function registrarAviso(matricula, nome, aviso) {
