@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação 353) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -26,7 +26,7 @@
     // Campos da tela achados pelo rótulo. Só preencha se o "🔎 Diagnóstico" mostrar que precisa
     // forçar um seletor (ex: dataIni: '#h16_dtconc').
     const SELETORES = {
-        codigo: null, nome: null, afastCodigo: null, dataIni: null, dataFim: null, quantidade: null,
+        codigo: null, nome: null, dataIni: null, dataFim: null, quantidade: null,
         quantDias: null, numeroAto: null, tipoAto: null, anoAto: null, historico: null, incluir: null
     };
 
@@ -825,9 +825,27 @@
         return s ? document.querySelector(s) : null;
     }
 
+    const porId = id => document.getElementById(id);
+
     function telaAssentamento() {
+        if (porId('h16_regist') && porId('h12_assent')) return true;
         let fs = fieldsetPorLegenda('Assentamentos');
         return !!(fs && camposAposRotulo(fs, 'Afast/Assent').length);
+    }
+
+    // Enquanto o e-cidade mostra "Carregando assentamentos..." / "Definindo Valores Dinâmicos..."
+    // o formulário fica bloqueado: o robô espera antes de mexer nele
+    function formularioLivre() {
+        let f = elementosForm();
+        if (!f.dataIni || f.dataIni.disabled || !f.historico || f.historico.disabled || !f.incluir || f.incluir.disabled) return false;
+        return !Array.from(document.querySelectorAll('div, span, td')).some(el => el.children.length === 0 &&
+            /^(carregando|definindo valores|aguarde|processando)/i.test((el.textContent || '').trim()) &&
+            visivel(el) && !el.closest('#painel-ecas, #conferencia-ecas'));
+    }
+
+    async function esperarFormularioLivre() {
+        await esperarRedeOciosa();
+        await esperarAte(formularioLivre, 'o e-cidade terminar de carregar o formulário', 30000).catch(relancarErroSistema);
     }
 
     function elementosForm() {
@@ -835,23 +853,27 @@
         let servidor = camposAposRotulo(fs, 'Servidor');
         let afast = camposAposRotulo(fs, 'Afast/Assent');
         let fsHist = fieldsetPorLegenda('Histórico');
-        let link = fs ? Array.from(fs.querySelectorAll('a')).find(a => rotuloNorm(a.textContent) === 'servidor') : null;
+        let link = (porId('labelServidorAncora') || {}).querySelector ? porId('labelServidorAncora').querySelector('a') : null;
+        if (!link && fs) link = Array.from(fs.querySelectorAll('a')).find(a => rotuloNorm(a.textContent) === 'servidor') || null;
+        // Afast/Assent: h12_assent (código) + h12_assentdescr (descrição). O campo de texto h12_codigo é o
+        // "Sequencial Assentamento" (número do registro) e NÃO deve ser preenchido.
+        let selects = [porId('h12_assent'), porId('h12_assentdescr')].filter(Boolean);
+        if (!selects.length) selects = afast.filter(c => c.tagName === 'SELECT');
         return {
             fieldset: fs,
             linkServidor: link,
-            lancamento: camposAposRotulo(fs, 'Lançamento').find(c => c.tagName === 'SELECT') || null,
-            codigo: porSeletor('codigo') || servidor[0] || null,
-            nome: porSeletor('nome') || servidor[1] || null,
-            afastCodigo: porSeletor('afastCodigo') || afast.find(c => c.tagName === 'INPUT') || null,
-            afastSelects: afast.filter(c => c.tagName === 'SELECT'),
-            dataIni: porSeletor('dataIni') || camposAposRotulo(fs, 'Data inicial')[0] || null,
-            dataFim: porSeletor('dataFim') || camposAposRotulo(fs, 'Data final')[0] || null,
-            quantidade: porSeletor('quantidade') || camposAposRotulo(fs, 'Quantidade')[0] || null,
-            quantDias: porSeletor('quantDias') || camposAposRotulo(fs, 'Quant. dias')[0] || null,
-            numeroAto: porSeletor('numeroAto') || camposAposRotulo(fs, 'Número ato')[0] || null,
-            tipoAto: porSeletor('tipoAto') || camposAposRotulo(fs, 'Tipo ato')[0] || null,
-            anoAto: porSeletor('anoAto') || camposAposRotulo(fs, 'Ano ato')[0] || null,
-            historico: porSeletor('historico') || (fsHist || fs || document).querySelector('textarea'),
+            lancamento: porId('lancamento') || camposAposRotulo(fs, 'Lançamento').find(c => c.tagName === 'SELECT') || null,
+            codigo: porSeletor('codigo') || porId('h16_regist') || servidor[0] || null,
+            nome: porSeletor('nome') || porId('z01_nome') || servidor[1] || null,
+            afastSelects: selects,
+            dataIni: porSeletor('dataIni') || porId('h16_dtconc') || camposAposRotulo(fs, 'Data inicial')[0] || null,
+            dataFim: porSeletor('dataFim') || porId('h16_dtterm') || camposAposRotulo(fs, 'Data final')[0] || null,
+            quantidade: porSeletor('quantidade') || porId('quantidade') || camposAposRotulo(fs, 'Quantidade')[0] || null,
+            quantDias: porSeletor('quantDias') || porId('h16_quant') || camposAposRotulo(fs, 'Quant. dias')[0] || null,
+            numeroAto: porSeletor('numeroAto') || porId('h16_nrport') || camposAposRotulo(fs, 'Número ato')[0] || null,
+            tipoAto: porSeletor('tipoAto') || porId('h16_atofic') || camposAposRotulo(fs, 'Tipo ato')[0] || null,
+            anoAto: porSeletor('anoAto') || porId('h16_anoato') || camposAposRotulo(fs, 'Ano ato')[0] || null,
+            historico: porSeletor('historico') || porId('h16_histor') || (fsHist || fs || document).querySelector('textarea'),
             incluir: porSeletor('incluir') || botaoNoDoc(document, 'Incluir')
         };
     }
@@ -1031,28 +1053,25 @@
     }
 
     function assentamentoConfere(codigo) {
-        let f = elementosForm();
-        let codigoOk = (f.afastCodigo && f.afastCodigo.value.trim() === codigo) ||
-            f.afastSelects.some(s => s.value.trim() === codigo || textoOpcao(s) === codigo);
-        if (!codigoOk) return false;
-        let descricao = f.afastSelects.map(textoOpcao).find(t => t && !/^\d+$/.test(t)) || '';
+        let [selCodigo, selDescricao] = elementosForm().afastSelects;
+        if (!selCodigo || selCodigo.value.trim() !== codigo) return false;
+        let descricao = selDescricao ? textoOpcao(selDescricao) : textoOpcao(selCodigo);
         if (!descricao || /selecione/i.test(descricao)) return false;
         if (codigo === CODIGO_LICENCA && !/licen.{0,3}a\s*premio/.test(textoNorm(descricao))) return false;
         return descricao;
     }
 
+    // Escolhe o código na lista Afast/Assent (o onchange do e-cidade acerta a descrição)
     async function preencherAssentamento(codigo) {
-        let f = elementosForm();
-        if (f.afastCodigo) preencherCampo(f.afastCodigo, codigo);
-        let ok = await esperarAte(() => assentamentoConfere(codigo), `o assentamento ${codigo} carregar`, TEMPO_LIMITE_ASSENT)
-            .catch(e => { relancarErroSistema(e); return null; });
-        if (ok) return ok;
-        // Plano B: escolhe o código direto na lista
-        for (let s of elementosForm().afastSelects) {
-            let opcao = Array.from(s.options).find(o => o.value.trim() === codigo || o.text.trim() === codigo || o.text.trim().startsWith(codigo + ' '));
-            if (opcao) { s.value = opcao.value; dispararEventos(s); }
+        let selCodigo = elementosForm().afastSelects[0];
+        if (!selCodigo) throw new Error('Formulário: não encontrei a lista Afast/Assent (envie o 🔎 Diagnóstico)');
+        let opcao = Array.from(selCodigo.options).find(o => o.value.trim() === codigo || o.text.trim() === codigo);
+        if (!opcao) throw new Error(`O código de assentamento ${codigo} não existe na lista Afast/Assent do e-cidade — corrija a coluna Código na conferência (📝)`);
+        if (selCodigo.value !== opcao.value) {
+            selCodigo.value = opcao.value;
+            dispararEventos(selCodigo);
         }
-        ok = await esperarAte(() => assentamentoConfere(codigo), `o assentamento ${codigo} carregar`, TEMPO_LIMITE_ASSENT)
+        let ok = await esperarAte(() => assentamentoConfere(codigo), `o assentamento ${codigo} carregar`, TEMPO_LIMITE_ASSENT)
             .catch(e => { relancarErroSistema(e); return null; });
         if (!ok) {
             let desc = elementosForm().afastSelects.map(textoOpcao).join(' / ');
@@ -1084,12 +1103,15 @@
     async function preencherFormulario(it) {
         let f = elementosForm();
         exigirCampos(f, ['dataIni', 'dataFim', 'numeroAto', 'anoAto', 'historico', 'incluir'], 'Formulário');
+        await esperarFormularioLivre();
+        if (!servidorNaTela(it.matriculaSistema)) throw new ConferenciaFalhou(`Conferência falhou: o servidor ${it.matriculaSistema} saiu da tela antes de preencher`);
+        f = elementosForm();
         if (f.lancamento) {
             let individual = Array.from(f.lancamento.options).find(o => /individual/i.test(o.text));
             if (individual && f.lancamento.value !== individual.value) { f.lancamento.value = individual.value; dispararEventos(f.lancamento); }
         }
         let descricao = await preencherAssentamento(it.codigo);
-        await esperarRedeOciosa();
+        await esperarFormularioLivre();
 
         f = elementosForm();
         preencherData(f.dataIni, it.dataIni);
@@ -1189,11 +1211,11 @@
         let matricula = await selecionarServidor(it, itens, indice);
         it.matriculaSistema = matricula;
         salvarItem(indice, { matriculaSistema: matricula });
-        await esperarRedeOciosa();
+        await esperarFormularioLivre();
         checarParada();
 
         // 2. Já lançado? Só confia no grid se ele recarregou para este servidor (ou já era dele)
-        let recarregou = await esperarAte(() => gridRecarregou(), 'o grid do servidor recarregar', 6000)
+        let recarregou = await esperarAte(() => gridRecarregou(), 'o grid do servidor recarregar', 15000)
             .then(() => true, e => { relancarErroSistema(e); return false; });
         if (recarregou) gridDaMatricula = matricula;
         if (gridDaMatricula === matricula) {
