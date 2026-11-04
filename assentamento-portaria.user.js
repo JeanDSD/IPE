@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação 353) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -784,16 +784,23 @@
         return textoNorm(texto).replace(/[▲▼]/g, '').trim();
     }
 
+    // Texto do cabeçalho: no resultado da pesquisa ele é um botão (<input type="button" value="Matrícula">)
+    function textoCabecalho(celula) {
+        let t = (celula.textContent || '').trim();
+        if (!t) t = Array.from(celula.querySelectorAll('input[type=button], input[type=submit], button')).map(b => b.value || b.textContent).join(' ');
+        return colunaCanonica(t);
+    }
+
     function lerTabela(escopo, colunasObrigatorias) {
         if (!escopo) return null;
         let trs = Array.from(escopo.querySelectorAll('tr'));
         let iCab = trs.findIndex(tr => {
-            let textos = Array.from(tr.cells).map(c => colunaCanonica(c.textContent));
+            let textos = Array.from(tr.cells).map(textoCabecalho);
             return colunasObrigatorias.every(col => textos.includes(col));
         });
         if (iCab < 0) return null;
         let trCab = trs[iCab];
-        let cab = Array.from(trCab.cells).map(c => colunaCanonica(c.textContent));
+        let cab = Array.from(trCab.cells).map(textoCabecalho);
         let tabelaCab = trCab.closest('table');
         let linhas = [];
         for (let tr of trs.slice(iCab + 1)) {
@@ -931,9 +938,11 @@
             if (servidorNaTela(null, it.nome) && !acharPopupPesquisa()) return { auto: true };
             let d = acharPopupPesquisa();
             if (!d) return null;
-            let c = campoNomePesquisa(d);
-            // o campo tem maxlength 40: o e-cidade pode devolver o nome cortado
-            if (!c || normalizarNome(c.value).slice(0, 40) !== normalizarNome(termo).slice(0, 40)) return null;
+            // nome pesquisado: no campo visível ou no oculto da paginação (chave_z01_nome);
+            // o campo tem maxlength 40, então o e-cidade pode devolver o nome cortado
+            let pesquisados = [campoNomePesquisa(d)].concat(Array.from(d.getElementsByName('chave_z01_nome')))
+                .filter(Boolean).map(c => normalizarNome(c.value).slice(0, 40));
+            if (!pesquisados.includes(normalizarNome(termo).slice(0, 40))) return null;
             if (!aceitarAntigo && d.__ecasVelho && assinaturaResultados(d) === antes) return null;
             let linhas = lerResultados(d);
             if (linhas && linhas.length) return { doc: d, linhas };
