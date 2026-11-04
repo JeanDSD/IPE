@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assentamentos - Lançamento a partir da foto da Portaria
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      2.0
 // @description  Lê a foto da portaria (OCR), monta os lançamentos (licença-prêmio 35, revogação REVOG) e lança em Assentamentos Normais > Inclusão do e-cidade.
 // @match        https://ecidade.saoborja.rs.gov.br/*
 // @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
@@ -1029,27 +1029,11 @@
         alvo.click();
     }
 
-    async function carregarPorMatricula(matricula, it) {
-        fecharPopupPesquisa();
-        let f = elementosForm();
-        exigirCampos(f, ['codigo', 'nome'], 'Servidor');
-        f.nome.value = '';
-        preencherCampo(f.codigo, String(matricula));
-        await esperarAte(() => servidorNaTela(matricula), `carregar a matrícula ${matricula}`).catch(relancarErroSistema);
-        f = elementosForm();
-        if (!servidorNaTela(matricula)) throw new Error(`Matrícula ${matricula} não carregou na tela`);
-        if (normalizarNome(it.nome) && !nomesBatem(f.nome.value, it.nome)) {
-            throw new Error(`A matrícula ${matricula} é de "${f.nome.value}", não de "${it.nome}" — corrija a coluna "Matrícula e-cidade" (📝)`);
-        }
-        return String(matricula);
-    }
-
     async function selecionarServidor(it, itens, indice) {
-        // Matrícula informada na conferência, ou já achada para o mesmo servidor (ex: revogação depois da licença)
+        // Sempre pesquisa pelo nome (link azul Servidor). A matrícula informada na conferência, ou já achada
+        // para o mesmo servidor (ex: revogação depois da licença), só ajuda a escolher a linha da lista
         let conhecida = it.matriculaSistema ||
             (itens.slice(0, indice).find(o => o.matriculaSistema && o.tipo !== 'pulado' && nomesBatem(o.nome, it.nome)) || {}).matriculaSistema;
-        if (conhecida) return carregarPorMatricula(conhecida, it);
-
         let rotulo = `"${it.nome}"`;
         await esperarFormularioLivre();
         let tentados = [];
@@ -1074,7 +1058,8 @@
             let cands = r.linhas.filter(l => nomesBatem(l.nome, it.nome));
             tentados.push(`"${termo}": ${r.linhas.length} resultado(s)`);
             if (!cands.length) continue;
-            let escolha = escolherCadastro(cands, it);
+            let daMatricula = conhecida ? cands.filter(l => l.matricula === String(conhecida)) : [];
+            let escolha = daMatricula.length === 1 ? { linha: daMatricula[0], motivo: 'matrícula já conhecida' } : escolherCadastro(cands, it);
             if (escolha.erro) {
                 fecharPopupPesquisa();
                 throw new Error(`${rotulo}: ${escolha.erro}. Informe a matrícula certa na coluna "Matrícula e-cidade" (📝) e use ▶ Iniciar`);
